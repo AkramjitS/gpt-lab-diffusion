@@ -212,13 +212,14 @@ def distributed_data_generator(master_process, logfile, args, filename_pattern: 
             #buf = torch.cat([leading_token, buf])
             #inputs = buf[:-2].to(device="cuda", dtype=torch.int32, non_blocking=True) # no sync on host side;
             #targets = buf[2:].to(device="cuda", dtype=torch.int64, non_blocking=True) # H2D in another stream isn't helpful.
-            #pos += batch_size
+            pos += batch_size
             yield inputs, targets
         else:
             if pos + batch_size >= len(tokens):
                 tokens, pos = _load_data_shard(next(file_iter)), 0
             buf = tokens[pos + rank * local_batch_size:][:local_batch_size]
             output = buf.to(device="cuda", dtype=torch.int32, non_blocking=True)
+            pos += batch_size
             yield output, None
 
 def print0(master_process, logfile, s, console=False):
