@@ -447,7 +447,7 @@ def main():
             
             # Calculate average time per step up to this point
             step_avg_ms = training_time_ms / max(step, 1) 
-            print0(master_process, logfile, f"step:{step}/{args.train_steps} val_loss:{val_loss:.4f} "
+            print0(master_process, logfile, f"step:{step}/{args.train_steps} val_loss:{val_loss:.4e} "
                     f"train_time:{training_time_ms:.0f}ms step_avg:{step_avg_ms:.2f}ms", console=True)
             
             # Log validation metrics to CSV
