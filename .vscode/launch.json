@@ -1,0 +1,66 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "train_diffusion",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "train_diffusion.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--train_seq_len", "11264",
+                "--val_seq_len", "11264",
+                "--train_steps", "3",
+                "--num_layers", "12",
+                "--num_heads", "6",
+                "--model_dim", "384",
+                "--num_val_emb", "3",
+                "--save_model", "True",
+                "--cuda", "1"
+              ]
+        },
+        {
+            "name": "old_train_diffusion",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "old_train_diffusion.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--train_files",
+                "data/fineweb*_train_*.bin",
+                "--val_files",
+                "data/fineweb*_val_*.bin",
+                "--train_steps",
+                "3000",
+                "--schedule",
+                "uniform",
+                "--remask",
+                "random",
+                "--seed",
+                "1103122614",
+                "--run_tag",
+                "uniform-random-rb0-sc0-r0"
+              ]
+        },
+        {
+            "name": "train_gpt",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "train_gpt.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--train_seq_len", "8192",
+                "--val_seq_len", "16384",
+                "--train_steps", "3",
+                "--num_layers", "8",
+                "--num_heads", "4",
+                "--model_dim", "256",
+                "--save_model", "True",
+                "--cuda", "1"
+              ]
+        }
+    ]
+}

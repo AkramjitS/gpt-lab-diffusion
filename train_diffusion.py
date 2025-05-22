@@ -18,6 +18,8 @@ import csv
 import random
 import math
 import numpy as np # Import numpy for potential future use, set random seed now not to forget to set it later
+from diffusion.model import DiffusionConfig, DiffusionGPT
+from diffusion.scheduler import MaskScheduleCfg, MaskScheduler
 from gpt.helper import *
 from gpt.model import *
 from gpt.hellaswag import *
@@ -267,18 +269,38 @@ def main():
     #    Construct model and optimizer     #
     ########################################
 
-    model: nn.Module = GPT(vocab_size=args.vocab_size, 
+    cfg = DiffusionConfig()
+    model: nn.Module = Diffusion(vocab_size=args.vocab_size,
+                        mask_token_id=cfg.mask_token_id,
                         num_layers=args.num_layers,
                         num_val_emb=args.num_val_emb,
                         num_heads=args.num_heads, 
                         model_dim=args.model_dim,
                         max_seq_len=max(args.train_seq_len, args.val_seq_len),
-                        mlp_ratio=args.mlp_ratio).cuda()
+                        mlp_ratio=args.mlp_ratio,
+                        num_steps=cfg.num_steps).cuda()
     print0(master_process, logfile, f'{model.get_num_params()} parameters', console=True)
     print0(master_process, logfile, model)
+    
+    
+    #model = DiffusionGPT(cfg).cuda()
+    #opt_list = make_optim(model, args.lr, args.mu_lr)
+    #model = torch.compile(model).to(device)
+
+    sched_cfg = MaskScheduleCfg(
+        #num_steps=cfg.num_steps,
+        #mask_token_id=cfg.mask_token_id,
+        #schedule="uniform", #args.schedule,
+        #remask="random", #args.remask,
+        #top_p=0.9, #args.top_p,
+        #deterministic_seed=args.seed if args.seed is not None else 0 #args.det_seed,
+        #use_inference_scaling=False, #args.infer_scaling,
+        #target_accept=0.9, #args.target_accept,
+    )
+    scheduler = MaskScheduler(sched_cfg)
 
     # Set FP8 option based on hyperparameters
-    model.lm_head.use_fp8 = args.use_fp8
+    #model.lm_head.use_fp8 = args.use_fp8
 
     for m in model.modules():
         if isinstance(m, nn.Embedding):
@@ -353,7 +375,8 @@ def main():
             inputs = targets = torch.randint(0, args.vocab_size, size=(args.train_seq_len,), device="cuda", dtype=torch.int64)
             #torch.compiler.cudagraph_mark_step_begin()
                 # TODO why does un-commenting this^ line throw an error here in the warmup but not down in training?
-            step_loss = model(inputs.to(torch.int32), targets)
+            t = torch.randint(0, model.num_steps, (1,), device='cuda')
+            step_loss = model(inputs.to(torch.int32), t, targets)
             loss += step_loss / args.grad_acc_steps
         loss.backward()
         if world_size > 1:
@@ -376,7 +399,7 @@ def main():
     #        Training and validation       #
     ########################################
 
-    train_loader = distributed_data_generator(master_process, logfile, args, args.train_files, world_size * args.train_seq_len, rank, world_size)
+    train_loader = distributed_data_generator(master_process, logfile, args, args.train_files, world_size * args.train_seq_len, rank, world_size, diffusion=True)
 
     training_time_ms = 0
     # start the clock
@@ -401,16 +424,22 @@ def main():
             val_tokens_used = val_batch_size * args.val_steps
             print0(master_process, logfile, f"Validating on {val_tokens_used} tokens ({args.val_steps} steps with {val_batch_size} batch size)", console=True)
             
-            val_loader = distributed_data_generator(master_process, logfile, args, args.val_files, val_batch_size, rank, world_size, print_stats=False)
+            val_loader = distributed_data_generator(master_process, logfile, args, args.val_files, val_batch_size, rank, world_size, print_stats=False, diffusion=True)
             val_loss = 0
+            # TODO modify for validation
             with torch.no_grad():
                 for i in range(args.val_steps):
-                    inputs, targets = next(val_loader)
+                    inputs, _ = next(val_loader)
+                    B = inputs.size(0)
                     # Check if inputs exceed sequence length
-                    if inputs.size(0) > args.val_seq_len:
+                    if B > args.val_seq_len:
                         inputs = inputs[:args.val_seq_len]
-                        targets = targets[:args.val_seq_len]
-                    val_loss += model(inputs, targets)
+                    t = torch.randint(0, model.num_steps, (1,), device='cuda')
+                    val_loss += model(
+                        inputs,
+                        t, 
+                        inputs
+                    )
             val_loss /= args.val_steps
             del val_loader
             if world_size > 1:
@@ -451,13 +480,19 @@ def main():
         # --------------- TRAINING SECTION -----------------
         loss = torch.tensor([0.], device="cuda")
         for _ in range(args.grad_acc_steps):
-            inputs, targets = next(train_loader)
+            inputs, _ = next(train_loader)
+            B = inputs.size(0)
             # Check if inputs exceed sequence length - can happen if the dataset has different sized examples
-            if inputs.size(0) > args.train_seq_len:
+            if B > args.train_seq_len:
                 inputs = inputs[:args.train_seq_len]
-                targets = targets[:args.train_seq_len]
+            t = torch.randint(0, model.num_steps, (1,), device='cuda')
+            
             torch.compiler.cudagraph_mark_step_begin()
-            step_loss = model(inputs, targets)
+            step_loss = model(
+                inputs,
+                t,
+                inputs
+            )
             loss += step_loss / args.grad_acc_steps
         loss.backward()
             
@@ -488,6 +523,7 @@ def main():
             approx_cumulative_time_ms = training_time_ms + current_segment_duration_ms
             approx_step_avg_ms = approx_cumulative_time_ms / (step + 1)
             print0(master_process, logfile, f"step:{step+1}/{args.train_steps} "
+                    f"train_loss:{loss.item():4e} "
                     f"train_time:{approx_cumulative_time_ms:.0f}ms "
                     f"step_avg:{approx_step_avg_ms:.2f}ms", console=True)
             
@@ -505,7 +541,7 @@ def main():
     # After training and sample generations, evaluate on HellaSwag
     hellaswag_path = "./data/hellaswag_val.jsonl" 
     # Check if the HellaSwag data file exists
-    if os.path.exists(hellaswag_path):
+    if os.path.exists(hellaswag_path) and False:
         print0(master_process, logfile, f"Found HellaSwag dataset at {hellaswag_path}", console=True)
         evaluate_hellaswag(master_process, logfile, world_size, rank, args, model, hellaswag_path, limit=1014) # 1014 is largest possible
     else:
@@ -538,7 +574,7 @@ def main():
         # add leading token 50256
         #leading_token = torch.tensor([50256], dtype=x.dtype, device=x.device)
         #x = torch.cat([leading_token, x])
-        
+
         # Generate
         model.eval()
         with torch.no_grad():

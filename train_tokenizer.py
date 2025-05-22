@@ -203,11 +203,13 @@ def bpe_train(
         ranks[bytes([i])] = i
     
     # choose efficient data type
-    int_type = torch.int16 if vocab_size <= (2**16)-2 else torch.int32
+    small_vocab = vocab_size <= (2**16)-2
+    #int_type = torch.int16 if small_vocab else torch.int32
+    int_type = torch.int32
     assert vocab_size <= (2**31)-2, f"bro why you making such a big tokenizer? {vocab_size}"
     # set indicator tokens for merging ops
-    SEPARATOR_TOKEN = -32_768 if int_type == torch.int16 else -2_147_483_648
-    REMOVE_TOKEN = 32_767 if int_type == torch.int16 else 2_147_483_647
+    SEPARATOR_TOKEN = -32_768 if small_vocab else -2_147_483_648
+    REMOVE_TOKEN = 32_767 if small_vocab else 2_147_483_647
 
     # Splinter up our data into lists of bytes
     words: list[list[bytes]] = [
