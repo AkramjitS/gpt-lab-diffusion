@@ -19,6 +19,7 @@
                 "--model_dim", "384",
                 "--num_val_emb", "3",
                 "--save_model", "True",
+                "--hellaswag_validation", "True",
                 "--cuda", "1"
               ]
         },

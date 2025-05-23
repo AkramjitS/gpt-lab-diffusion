@@ -1,3 +1,6 @@
+# This is a fork of GPT-LAB for experimenting with text-diffusion models
+The following is from the original repo at: [GPT-Lab](https://github.com/evintunador/gpt-lab)
+
 # GPT-Lab **(currently in ALPHA)**
 this repo is a massive overhaul of [Modded-NanoGPT](https://github.com/KellerJordan/modded-nanogpt) with the goal of being a base for amateurs to do cheap & easy LLM experiments at a large enough scale to be worthy of an arxiv preprint. the idea is that repos like Modded-NanoGPT, [NanoGPT](https://github.com/karpathy/nanoGPT), [TinyLlama](https://github.com/jzhang38/TinyLlama), and [Meta's Lingua](https://github.com/facebookresearch/lingua), are either too old of an architecture, too purpose-specific, not from-scratch enough, too expensive to run, too overly-complicated, not well setup for quickly iterating research ideas, etc and we plan to occupy a unique balance of those trade-offs
 

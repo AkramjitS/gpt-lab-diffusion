@@ -112,6 +112,7 @@ class Hyperparameters:
                             help='experimental; True on H100s (and newer?) should improve performance but seems to use more vram somehow')
         parser.add_argument('--val_loss_every', type=int, help='Evaluate validation loss every N steps')
         parser.add_argument('--save_model', type=lambda x: (str(x).lower() == 'true'), default=None, help='Save model checkpoints')
+        parser.add_argument('--hellaswag_validation', type=lambda x: (str(x).lower() == 'true'), default=False, help='Perform HellaSwag validation after pretraining')
         parser.add_argument('--model_name', type=str, help='Model name for logging')
         parser.add_argument('--seed', type=int, help='Random seed for initialization control')
         
@@ -541,9 +542,9 @@ def main():
     # After training and sample generations, evaluate on HellaSwag
     hellaswag_path = "./data/hellaswag_val.jsonl" 
     # Check if the HellaSwag data file exists
-    if os.path.exists(hellaswag_path) and False:
+    if os.path.exists(hellaswag_path) and True:
         print0(master_process, logfile, f"Found HellaSwag dataset at {hellaswag_path}", console=True)
-        evaluate_hellaswag(master_process, logfile, world_size, rank, args, model, hellaswag_path, limit=1014) # 1014 is largest possible
+        evaluate_hellaswag(master_process, logfile, world_size, rank, args, model, hellaswag_path, limit=1014, diffusion=True) # 1014 is largest possible
     else:
         print0(master_process, logfile, f"HellaSwag dataset not found at {hellaswag_path}, skipping evaluation.", console=True)
 
@@ -591,7 +592,8 @@ def main():
             "Once upon a time,",
             "The meaning of life is",
             "In the year 2026,",
-            "I'm a Large Language Model (LLM), which means"
+            "I'm a Large Language Model (LLM), which means",
+            "2 + 3 = "
         ]
         for prompt in prompts:
             continuation = sample_from_model(model, prompt, max_new_tokens=16)
