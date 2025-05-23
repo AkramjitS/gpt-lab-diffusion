@@ -50,7 +50,7 @@ def iterate_hellaswag_examples(data_path, limit=1014):
             yield example
 
 @torch.no_grad()
-def evaluate_hellaswag(master_process, logfile, world_size, rank, args, model, data_path, limit=1014):
+def evaluate_hellaswag(master_process, logfile, world_size, rank, args, model, data_path, limit=1014, diffusion=False):
     """Evaluate model on HellaSwag in a distributed way using modulo distribution"""
     assert limit <= 1014, f'there are only 1014 questions in the benchmark, but got limit={limit}'
     torch._dynamo.config.disable = True
@@ -109,7 +109,11 @@ def evaluate_hellaswag(master_process, logfile, world_size, rank, args, model, d
                                     dim=0)
             
             # Get logits from our model
-            logits = model(valid_seq)
+            if diffusion:
+                t = torch.randint(0, model.num_steps, (1,), device='cuda')
+                logits = model(valid_seq, t)
+            else:
+                logits = model(valid_seq)
             if isinstance(logits, torch.Tensor):
                 logits = logits[0]  # Our model returns [B, T, V] but B=1
             
