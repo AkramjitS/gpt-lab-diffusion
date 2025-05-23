@@ -18,8 +18,6 @@ import csv
 import random
 import math
 import numpy as np # Import numpy for potential future use, set random seed now not to forget to set it later
-from diffusion.model import DiffusionConfig, DiffusionGPT
-from diffusion.scheduler import MaskScheduleCfg, MaskScheduler
 from gpt.helper import *
 from gpt.model import *
 from gpt.hellaswag import *
