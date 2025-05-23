@@ -67,6 +67,12 @@ class Hyperparameters:
     # reproducibility
     seed: int | None = None # Optional random seed for initialization control
 
+    # my variables
+    cuda: int = 1
+    hellaswag_validation: bool = False
+    mask_token_id: int = 50255
+    num_generate_steps: int = 50
+
     def __post_init__(self):
         # Validate and set derived parameters
         assert self.train_seq_len % 128 == 0, f"train_seq_len must be multiple of 128, got {self.train_seq_len}"
@@ -112,13 +118,22 @@ class Hyperparameters:
                             help='experimental; True on H100s (and newer?) should improve performance but seems to use more vram somehow')
         parser.add_argument('--val_loss_every', type=int, help='Evaluate validation loss every N steps')
         parser.add_argument('--save_model', type=lambda x: (str(x).lower() == 'true'), default=None, help='Save model checkpoints')
-        parser.add_argument('--hellaswag_validation', type=lambda x: (str(x).lower() == 'true'), default=False, help='Perform HellaSwag validation after pretraining')
         parser.add_argument('--model_name', type=str, help='Model name for logging')
         parser.add_argument('--seed', type=int, help='Random seed for initialization control')
         
         # my options
         parser.add_argument('--cuda', type=int, default=0,
                             help='provide which gpu to use')
+        parser.add_argument('--hellaswag_validation', 
+                            type=lambda x: (str(x).lower() == 'true'), 
+                            #default=False, 
+                            help='Perform HellaSwag validation after pretraining')
+        parser.add_argument('--mask_token_id', type=int, 
+                            #default=50255,
+                            help='Default integer value for mask_token_id')
+        parser.add_argument('--num_generate_steps', type=int,
+                            #default=50,
+                            help='Maximum generatation steps')
         
         args = parser.parse_args()
         
@@ -270,35 +285,17 @@ def main():
     #    Construct model and optimizer     #
     ########################################
 
-    cfg = DiffusionConfig()
     model: nn.Module = Diffusion(vocab_size=args.vocab_size,
-                        mask_token_id=cfg.mask_token_id,
+                        mask_token_id=args.mask_token_id,
                         num_layers=args.num_layers,
                         num_val_emb=args.num_val_emb,
                         num_heads=args.num_heads, 
                         model_dim=args.model_dim,
                         max_seq_len=max(args.train_seq_len, args.val_seq_len),
                         mlp_ratio=args.mlp_ratio,
-                        num_steps=cfg.num_steps).cuda()
+                        num_steps=args.num_generate_steps).cuda()
     print0(master_process, logfile, f'{model.get_num_params()} parameters', console=True)
     print0(master_process, logfile, model)
-    
-    
-    #model = DiffusionGPT(cfg).cuda()
-    #opt_list = make_optim(model, args.lr, args.mu_lr)
-    #model = torch.compile(model).to(device)
-
-    sched_cfg = MaskScheduleCfg(
-        #num_steps=cfg.num_steps,
-        #mask_token_id=cfg.mask_token_id,
-        #schedule="uniform", #args.schedule,
-        #remask="random", #args.remask,
-        #top_p=0.9, #args.top_p,
-        #deterministic_seed=args.seed if args.seed is not None else 0 #args.det_seed,
-        #use_inference_scaling=False, #args.infer_scaling,
-        #target_accept=0.9, #args.target_accept,
-    )
-    scheduler = MaskScheduler(sched_cfg)
 
     # Set FP8 option based on hyperparameters
     #model.lm_head.use_fp8 = args.use_fp8
@@ -542,7 +539,7 @@ def main():
     # After training and sample generations, evaluate on HellaSwag
     hellaswag_path = "./data/hellaswag_val.jsonl" 
     # Check if the HellaSwag data file exists
-    if os.path.exists(hellaswag_path) and True:
+    if os.path.exists(hellaswag_path) and args.hellaswag_validation:
         print0(master_process, logfile, f"Found HellaSwag dataset at {hellaswag_path}", console=True)
         evaluate_hellaswag(master_process, logfile, world_size, rank, args, model, hellaswag_path, limit=1014, diffusion=True) # 1014 is largest possible
     else:
