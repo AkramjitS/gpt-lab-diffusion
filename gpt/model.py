@@ -358,7 +358,7 @@ class Diffusion(nn.Module):
             p_mask = self.get_p_mask(t)
             mask = torch.rand(L, device=device) < p_mask
             if not mask.any():
-                mask[torch.randint(L, (1,), device=device)] = True
+                mask[torch.randint(high=L, size=(1,), device=device)] = True
         else:
             p_mask = None
 

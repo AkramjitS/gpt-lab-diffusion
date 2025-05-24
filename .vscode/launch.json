@@ -11,15 +11,15 @@
             "program": "train_diffusion.py",
             "console": "integratedTerminal",
             "args": [
-                "--train_seq_len", "11264",
-                "--val_seq_len", "11264",
-                "--train_steps", "3",
+                "--train_seq_len", "11_264",
+                "--val_seq_len", "11_264",
+                "--train_steps", "10_000",
                 "--num_layers", "12",
                 "--num_heads", "6",
                 "--model_dim", "384",
                 "--num_val_emb", "3",
                 "--save_model", "True",
-                "--hellaswag_validation", "False",
+                "--hellaswag_validation", "True",
                 "--cuda", "1"
               ]
         },
