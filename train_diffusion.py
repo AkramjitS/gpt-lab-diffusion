@@ -9,6 +9,7 @@ from functools import lru_cache
 from pathlib import Path
 import argparse
 import itertools
+from itertools import islice
 import tiktoken
 import json
 import datetime
@@ -18,6 +19,7 @@ import csv
 import random
 import math
 import numpy as np # Import numpy for potential future use, set random seed now not to forget to set it later
+from datasets import load_dataset
 from gpt.helper import *
 from gpt.model import *
 from gpt.hellaswag import *
@@ -29,6 +31,7 @@ from torch import Tensor, nn
 import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn.attention.flex_attention import BlockMask, flex_attention, create_block_mask
+from torch.utils.data import DataLoader
 #torch._inductor.config.max_autotune_gemm_backends = ["ATEN"]
 
 @dataclass
@@ -38,8 +41,8 @@ class Hyperparameters:
     """
     model_name = "ModdedGPT"
     # data
-    train_files = "data/fineweb*_train_*.bin" # input .bin to train on
-    val_files = "data/fineweb*_val_*.bin" # input .bin to eval validation loss on
+    #train_files = "data/fineweb*_train_*.bin" # input .bin to train on
+    #val_files = "data/fineweb*_val_*.bin" # input .bin to eval validation loss on
     train_seq_len = 8*1024 # FlexAttention sequence length
     val_seq_len = 16*1024 # FlexAttention sequence length for validation (should be able to fit more than train_seq_len)
     # optimization loop
@@ -49,7 +52,7 @@ class Hyperparameters:
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
     # architecture
     tokenizer = "gpt4regex_v50256_n1000000000.pkl"# any .pkl file in tokenizers/
-    vocab_size = 50257 # should be the tokenizer's size plus any special tokens
+    #vocab_size = 50257 # should be the tokenizer's size plus any special tokens
     # model size - parameters set for GPUs w/ 8GB VRAM
     num_layers = 12  # number of reansformer blocks
     num_heads = 6   # number of attention heads
@@ -68,8 +71,9 @@ class Hyperparameters:
     # my variables
     cuda: int = 1
     hellaswag_validation: bool = False
-    mask_token_id: int = 50255
     num_generate_steps: int = 50
+    train_val_dataset: str = "HuggingFaceFW/fineweb-edu"
+    save_every: int | None = None
 
     def __post_init__(self):
         # Validate and set derived parameters
@@ -83,6 +87,9 @@ class Hyperparameters:
         assert self.num_layers // 2 >= self.num_val_emb, \
             f"num_layers // 2 (={self.num_layers // 2}) must be greater than or equal num_val_emb (={self.num_val_emb})"
         assert self.num_layers % 2 == 0, f"Number of layers ({self.num_layers}) must be even for skip connections"
+        if self.save_every is not None:
+            assert self.save_every > 0, f"save_every={args.save_every} must be a positive int"
+            assert self.save_every % self.val_loss_every == 0, f"save_every={self.save_every} needs to be a multiple of val_loss_every={self.val_loss_every}"
 
     @classmethod
     def from_args(cls):
@@ -90,8 +97,8 @@ class Hyperparameters:
         parser = argparse.ArgumentParser(description="Train a GPT model with customizable hyperparameters")
         
         # Data arguments
-        parser.add_argument('--train_files', type=str, help='Pattern for training data files')
-        parser.add_argument('--val_files', type=str, help='Pattern for validation data files')
+        #parser.add_argument('--train_files', type=str, help='Pattern for training data files')
+        #parser.add_argument('--val_files', type=str, help='Pattern for validation data files')
         parser.add_argument('--train_seq_len', type=int, help='Training sequence length')
         parser.add_argument('--val_seq_len', type=int, help='Validation sequence length')
         
@@ -103,7 +110,7 @@ class Hyperparameters:
         
         # Architecture arguments
         parser.add_argument('--tokenizer', type=str, help='Tokenizer file name in tokenizers/ directory')
-        parser.add_argument('--vocab_size', type=int, help='Vocabulary size')
+        #parser.add_argument('--vocab_size', type=int, help='Vocabulary size')
         parser.add_argument('--num_layers', type=int, help='Number of transformer layers')
         parser.add_argument('--num_heads', type=int, help='Number of attention heads')
         parser.add_argument('--model_dim', type=int, help='Model embedding dimension')
@@ -124,14 +131,13 @@ class Hyperparameters:
                             help='provide which gpu to use')
         parser.add_argument('--hellaswag_validation', 
                             type=lambda x: (str(x).lower() == 'true'), 
-                            #default=False, 
                             help='Perform HellaSwag validation after pretraining')
-        parser.add_argument('--mask_token_id', type=int, 
-                            #default=50255,
-                            help='Default integer value for mask_token_id')
         parser.add_argument('--num_generate_steps', type=int,
-                            #default=50,
                             help='Maximum generatation steps')
+        parser.add_argument('--train_val_dataset', type=str,
+                            help='Dataset to load from HuggingFace for train and validation')
+        parser.add_argument('--save_every', type=int,
+                            help="save_every must be a postive int and a multiple of val_loss_every")
         
         args = parser.parse_args()
         
@@ -230,27 +236,47 @@ def main():
                     print0(master_process, logfile, f"- Failed to copy {file_path}: {e}")
             else:
                 print0(master_process, logfile, f"- File not found, skipping: {file_path}")
+               
+        # Handle tokenizer separately
+        try:
+            from transformers import AutoTokenizer
+            tokenizer = AutoTokenizer.from_pretrained("distilroberta-base", use_fast=True, model_max_length=args.train_seq_len)
+        except Exception as e:
+            print0(master_process, logfile, f"- Tokenizer distilroberta-base failed to load. Error: {e}")
+           
+        assert args.train_seq_len == args.val_seq_len, f"Currenty require that train_seq_len equals val_train_seq for dataset loader"
+           
+        def preprocess(example):
+            #ids = tokenizer(example["text"], add_special_tokens=False).input_ids
+            #return {"input_ids": ids + [tokenizer.eos_token_id]}
+            ids = tokenizer(example["text"], add_special_tokens=True).input_ids
+            return {"input_ids": ids}  
+        # fineweb for train and validation
+        try:
+            ds = load_dataset(args.train_val_dataset, split="train", streaming=True)
+            ds = ds.shuffle()
+            ds = ds.map(preprocess, batched=False)
 
-        # Handle tokenizer separately as it's a .pkl file
-        tokenizer_path = Path(f"data/{args.tokenizer}")
-        if tokenizer_path.exists():
-            try:
-                with open(tokenizer_path, 'rb') as f:
-                    tokenizer_config = pickle.load(f)
-                # Save the config as a pretty-printed text file
-                tokenizer_log_path = experiment_dir_path / f"{tokenizer_path.stem}_config.txt"
-                import pprint
-                tokenizer_str = pprint.pformat(tokenizer_config)
-                with open(tokenizer_log_path, "w") as f:
-                    f.write(f"Tokenizer Config ({args.tokenizer}):\n")
-                    f.write("="*100 + "\n")
-                    f.write(tokenizer_str)
-                print0(master_process, logfile, f"- Saved tokenizer config to {tokenizer_log_path}")
-                del tokenizer_config # Free up memory
-            except Exception as e:
-                print0(master_process, logfile, f"- Error processing tokenizer {tokenizer_path}: {e}")
-        else:
-            print0(master_process, logfile, f"- Tokenizer file not found: {tokenizer_path}")
+            all_chunks = ContinuousChunks(ds, block_size=args.train_seq_len)
+            #val_slice   = islice(all_chunks, args.val_steps)
+            #train_slice = islice(all_chunks, args.val_steps, None)
+            #val_chunks   = SlicedChunks(val_slice)
+            #train_chunks = SlicedChunks(train_slice)
+            #train_loader = DataLoader(train_chunks, batch_size=1)
+            #val_loader   = DataLoader(val_chunks,   batch_size=1)
+            #train_loader = make_val_loader(all_chunks, ds, args.train_seq_len, args.val_steps, True)
+            #val_loader   = make_val_loader(all_chunks, ds, args.train_seq_len, args.val_steps, False)
+        except Exception as e:
+            print0(master_process, logfile, f"- Error loading dataset: {args.train_val_dataset}. Error: {e}")
+        # hellaswag dataset for test
+        #try:
+        #    ds_hellaswag = load_dataset("hellaswag", split="validation", streaming=True)
+        #    ds_hellaswag = ds_hellaswag.map(preprocess, batched=False)
+        #    
+        #    hellaswag_chunks = ContinuousChunks
+        #except Exception as e:
+        #    print0(master_process, logfile, f"- Error loading dataset: hellaswag. Error: {e}")
+        del preprocess
 
         print0(master_process, logfile, "="*100)
 
@@ -283,8 +309,10 @@ def main():
     #    Construct model and optimizer     #
     ########################################
 
-    model: nn.Module = Diffusion(vocab_size=args.vocab_size,
-                        mask_token_id=args.mask_token_id,
+    model: nn.Module = Diffusion(vocab_size=tokenizer.vocab_size,
+                        mask_token_id=tokenizer.mask_token_id,
+                        #eos_token_id=tokenizer.eos_token_id,
+                        bos_token_id=tokenizer.bos_token_id,
                         num_layers=args.num_layers,
                         num_val_emb=args.num_val_emb,
                         num_heads=args.num_heads, 
@@ -368,7 +396,7 @@ def main():
     for _ in range(warmup_steps):
         loss = torch.tensor([0.], device="cuda")
         for _ in range(args.grad_acc_steps):
-            inputs = targets = torch.randint(0, args.vocab_size, size=(args.train_seq_len,), device="cuda", dtype=torch.int64)
+            inputs = targets = torch.randint(0, tokenizer.vocab_size, size=(args.train_seq_len,), device="cuda", dtype=torch.int64)
             #torch.compiler.cudagraph_mark_step_begin()
                 # TODO why does un-commenting this^ line throw an error here in the warmup but not down in training?
             t = torch.randint(0, model.num_steps, (1,), device='cuda')
@@ -395,7 +423,9 @@ def main():
     #        Training and validation       #
     ########################################
 
-    train_loader = distributed_data_generator(master_process, logfile, args, args.train_files, world_size * args.train_seq_len, rank, world_size, diffusion=True)
+    #train_loader = distributed_data_generator(master_process, logfile, args, args.train_files, world_size * args.train_seq_len, rank, world_size, diffusion=True)
+    train_loader = make_val_loader(all_chunks, ds, args.train_seq_len, args.val_steps, True)
+    train_iter = iter(train_loader)
 
     training_time_ms = 0
     # start the clock
@@ -420,12 +450,14 @@ def main():
             val_tokens_used = val_batch_size * args.val_steps
             print0(master_process, logfile, f"Validating on {val_tokens_used} tokens ({args.val_steps} steps with {val_batch_size} batch size)", console=True)
             
-            val_loader = distributed_data_generator(master_process, logfile, args, args.val_files, val_batch_size, rank, world_size, print_stats=False, diffusion=True)
+            #val_loader = distributed_data_generator(master_process, logfile, args, args.val_files, val_batch_size, rank, world_size, print_stats=False, diffusion=True)
+            val_loader = make_val_loader(all_chunks, ds, args.train_seq_len, args.val_steps, False)
+            val_iter = iter(val_loader)
             val_loss = 0
             # TODO modify for validation
             with torch.no_grad():
                 for i in range(args.val_steps):
-                    inputs, _ = next(val_loader)
+                    inputs = torch.tensor(next(val_iter)['input_ids'], device='cuda')
                     B = inputs.size(0)
                     # Check if inputs exceed sequence length
                     if B > args.val_seq_len:
@@ -437,7 +469,7 @@ def main():
                         inputs
                     )
             val_loss /= args.val_steps
-            del val_loader
+            #del val_loader
             if world_size > 1:
                 dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
             
@@ -456,7 +488,7 @@ def main():
                         f"{training_time_ms:.0f}", 
                         f"{step_avg_ms:.2f}"])
 
-            if last_step: # inside validation section to avoid the if check every training iteration
+            if last_step or (step != 0 and args.save_every is not None and step % args.save_every == 0): # inside validation section to avoid the if check every training iteration
                 # 5. Save model checkpoint inside the experiment directory
                 if master_process and args.save_model and experiment_dir_path:
                     log = dict(step=step, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
@@ -466,7 +498,8 @@ def main():
                     torch.save(log, str(save_path))
                     print0(master_process, logfile, f"Saved checkpoint to {save_path}", console=True)
                 # the last step only has the validation loop, so break to avoid training
-                break
+                if last_step:
+                    break
             
             model.train()
             # start the clock again for the next training segment
@@ -476,7 +509,7 @@ def main():
         # --------------- TRAINING SECTION -----------------
         loss = torch.tensor([0.], device="cuda")
         for _ in range(args.grad_acc_steps):
-            inputs, _ = next(train_loader)
+            inputs = torch.tensor(next(train_iter)['input_ids'], device='cuda')
             B = inputs.size(0)
             # Check if inputs exceed sequence length - can happen if the dataset has different sized examples
             if B > args.train_seq_len:
@@ -550,22 +583,24 @@ def main():
     #        FINAL OUTPUT EXAMPLES         #
     ########################################
 
-    def sample_from_model(model, prompt, max_new_tokens=100, temperature=0.8, top_k=200):
+    def sample_from_model(model, tokenizer, prompt, max_new_tokens=100, temperature=0.8, top_k=200):
         """Generate text samples from the model given a prompt."""
-        tokenizer_config = pickle.load(open(f"tokenizers/{args.tokenizer}", 'rb'))
-        enc = tiktoken.Encoding(
-            name=args.tokenizer[:-4], # :-4 to remove the .pkl
-            pat_str=tokenizer_config['pat_str'],
-            mergeable_ranks=tokenizer_config['mergeable_ranks'],
-            special_tokens={
-                "<|endoftext|>": len(tokenizer_config['mergeable_ranks']),
-            }
-        )
-        encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
-        decode = lambda l: enc.decode(l)
+        #tokenizer_config = pickle.load(open(f"tokenizers/{args.tokenizer}", 'rb'))
+        #enc = tiktoken.Encoding(
+        #    name=args.tokenizer[:-4], # :-4 to remove the .pkl
+        #    pat_str=tokenizer_config['pat_str'],
+        #    mergeable_ranks=tokenizer_config['mergeable_ranks'],
+        #    special_tokens={
+        #        "<|endoftext|>": len(tokenizer_config['mergeable_ranks']),
+        #    }
+        #)
+        #encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
+        #decode = lambda l: enc.decode(l)
+        encode = tokenizer.encode
+        decode = tokenizer.decode
         
         # Encode the prompt
-        input_ids = encode(prompt)
+        input_ids = encode(prompt)[:-1]
         x = torch.tensor(input_ids, dtype=torch.int32, device="cuda")
         # add leading token 50256
         #leading_token = torch.tensor([50256], dtype=x.dtype, device=x.device)
@@ -574,11 +609,12 @@ def main():
         # Generate
         model.eval()
         with torch.no_grad():
-            y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
+            outputs = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
         
         # Decode and return
         #return decode(y[1:].tolist())
-        return decode(y.tolist())
+        #return decode(y.tolist())
+        return [decode(y.tolist()) for y in outputs]
 
     # Then at the end of training:
     if master_process: 
@@ -591,8 +627,9 @@ def main():
             "2 + 3 = "
         ]
         for prompt in prompts:
-            continuation = sample_from_model(model, prompt, max_new_tokens=16)
-            print0(master_process, logfile, continuation, console=True)
+            continuations = sample_from_model(model, tokenizer, prompt, max_new_tokens=16)
+            for index, continuation in enumerate(continuations):
+                print0(master_process, logfile, f"iteration: {index}, continuation={continuation}", console=True)
             
 if __name__ == "__main__":
     main()

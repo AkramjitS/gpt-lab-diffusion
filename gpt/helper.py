@@ -25,6 +25,8 @@ from torch import Tensor, nn
 import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn.attention.flex_attention import BlockMask, flex_attention, create_block_mask
+from torch.utils.data import IterableDataset
+from torch.utils.data import DataLoader
 # -----------------------------------------------------------------------------
 # Muon optimizer
 
@@ -154,6 +156,51 @@ class Muon(torch.optim.Optimizer):
 
 # -----------------------------------------------------------------------------
 # Our own simple Distributed Data Loader
+
+class ContinuousChunks(IterableDataset):
+    """
+    IterableDataset that concatenates streamed documents into a single token stream
+    and yields fixed-size chunks without padding, suitable for Gemma 2–style training.
+
+    Args:
+        dataset (IterableDataset): Streamed dataset yielding dicts with an "input_ids" list.
+        block_size (int): Desired chunk length in tokens.
+    """
+    def __init__(self, dataset, block_size):
+        self.dataset = dataset
+        self.block_size = block_size
+
+    def __iter__(self):
+        buffer = []
+        for example in self.dataset:
+            # Extend buffer with new document tokens (including EOS appended in preprocessing)
+            buffer.extend(example["input_ids"])
+            # Yield chunks while enough tokens are available
+            while len(buffer) >= self.block_size:
+                chunk = buffer[: self.block_size]
+                buffer = buffer[self.block_size :]
+                yield {"input_ids": chunk}
+
+class SlicedChunks(IterableDataset):
+    def __init__(self, sliced_iter):
+        super().__init__()
+        self.sliced = sliced_iter
+
+    def __iter__(self):
+        # Return a fresh iterator each time __iter__ is called
+        return iter(self.sliced)
+    
+#def infinite_batches(loader):
+#    while True:
+#        for batch in loader:
+#            yield batch
+def make_val_loader(all_chunks, ds, block_size, val_steps, is_train: bool):
+    if is_train:
+        slice = itertools.islice(all_chunks, val_steps, None)
+    else:
+        slice = itertools.islice(all_chunks, val_steps)
+    chunks = SlicedChunks(slice)
+    return DataLoader(chunks, batch_size=1)
 
 def _load_data_shard(file: Path):
     header = torch.from_file(str(file), False, 256, dtype=torch.int32) # header is 256 int32

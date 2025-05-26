@@ -188,7 +188,8 @@ class Block(nn.Module):
 # The main model
 
 def next_multiple_of_n(v: float | int, *, n: int):
-    return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
+    #return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
+    return (-v % n) + v
 
 class GPT(nn.Module):
     def __init__(self, 
@@ -302,6 +303,8 @@ class Diffusion(nn.Module):
         self, 
         vocab_size: int, 
         mask_token_id: int, 
+        #eos_token_id: int,
+        bos_token_id: int,
         num_layers: int, 
         num_val_emb: int, 
         num_heads: int, 
@@ -313,6 +316,8 @@ class Diffusion(nn.Module):
         super().__init__()
         self.vocab_size = vocab_size
         self.mask_token_id = mask_token_id
+        #self.eos_token_id = eos_token_id
+        self.bos_token_id = bos_token_id
         self.model_dim = model_dim
         self.max_seq_len = max_seq_len
         self.num_steps = num_steps
@@ -364,8 +369,9 @@ class Diffusion(nn.Module):
 
         # creating flex-attentio mask
         seq_src = target_seq if target_seq is not None else input_seq
-        docs = (seq_src == 50256).cumsum(0)
-        docs[seq_src == 50256] -= 1
+        #docs = (seq_src == self.eos_token_id).cumsum(0)
+        #docs[seq_src == self.eos_token_id] -= 1
+        docs = (seq_src == self.bos_token_id).cumsum(0)
         def doc_causal(b, h, q_idx, kv_idx):
             same = docs[q_idx] == docs[kv_idx]
             qm = mask[q_idx]
@@ -450,6 +456,8 @@ class Diffusion(nn.Module):
         
         self.eval()  # Ensure model is in evaluation mode
         mask = masked_seq[:masked_len] == self.mask_token_id
+        
+        outputs = [masked_seq[:masked_len].clone()]
         for t_id in range(self.num_steps - 1, -1, -1):
             #if torch.all(~mask[seq_len:masked_len]):
             #    break
@@ -468,6 +476,7 @@ class Diffusion(nn.Module):
             masked_seq[positions] = sampled_ids.to(dtype=masked_seq.dtype)
             
             # stop if fully unmasked (t=0) or no continuation left
+            outputs.append(masked_seq[:masked_len].clone())
             if t_id == 0:
                 break
             
@@ -504,4 +513,5 @@ class Diffusion(nn.Module):
             if torch.all(~mask[seq_len:masked_len]):
                 break
             #masked_seq[:masked_len][positions] = self.mask_token_id
-        return masked_seq[:masked_len]
+        #return masked_seq[:masked_len]
+        return outputs
