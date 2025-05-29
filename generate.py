@@ -97,6 +97,8 @@ class Hyperparameters:
 def get_model_tokenizer_args():
     args, cli_args = Hyperparameters.from_args()
     
+    print(f"input cli_args: {cli_args}")
+    
         # Check if environment variables are set by torchrun, otherwise default to single GPU
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ and "LOCAL_RANK" in os.environ:
         # Multi-GPU setup with torchrun
