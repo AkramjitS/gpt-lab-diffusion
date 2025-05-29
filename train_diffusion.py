@@ -244,7 +244,7 @@ def main():
         except Exception as e:
             print0(master_process, logfile, f"- Tokenizer distilroberta-base failed to load. Error: {e}")
            
-        assert args.train_seq_len == args.val_seq_len, f"Currenty require that train_seq_len equals val_train_seq for dataset loader"
+        assert args.train_seq_len == args.val_seq_len, f"Currenty require that train_seq_len equals val_seq_len for dataset loader"
            
         def preprocess(example):
             #ids = tokenizer(example["text"], add_special_tokens=False).input_ids
