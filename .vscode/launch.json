@@ -30,7 +30,7 @@
             "args": [
                 "--train_seq_len", "11264",
                 "--val_seq_len", "11264",
-                "--train_steps", "100",
+                "--train_steps", "160_000",
                 "--grad_acc_steps", "4",
                 "--num_layers", "8",
                 "--num_heads", "4",
@@ -38,8 +38,8 @@
                 "--save_model", "True",
                 "--hellaswag_validation", "False",
                 "--cuda", "3",
-                "--val_loss_every", "10", 
-                "--save_every", "20"
+                "--val_loss_every", "1_000", 
+                "--save_every", "2_000"
               ]
         },
         {
