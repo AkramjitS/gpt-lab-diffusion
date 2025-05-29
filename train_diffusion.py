@@ -88,7 +88,7 @@ class Hyperparameters:
             f"num_layers // 2 (={self.num_layers // 2}) must be greater than or equal num_val_emb (={self.num_val_emb})"
         assert self.num_layers % 2 == 0, f"Number of layers ({self.num_layers}) must be even for skip connections"
         if self.save_every is not None:
-            assert self.save_every > 0, f"save_every={args.save_every} must be a positive int"
+            assert self.save_every > 0, f"save_every={self.save_every} must be a positive int"
             assert self.save_every % self.val_loss_every == 0, f"save_every={self.save_every} needs to be a multiple of val_loss_every={self.val_loss_every}"
 
     @classmethod
