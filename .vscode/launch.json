@@ -5,6 +5,23 @@
     "version": "0.2.0",
     "configurations": [
         {
+            "name": "generate",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "generate.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--checkpoint_name", "state_step035000.pt",
+
+                "--cuda", "1",
+
+                "--num_layers", "8",
+                "--num_heads", "4",
+                "--model_dim", "256",
+                "--max_seq_len", "11264"
+              ]
+        },
+        {
             "name": "train_diffusion",
             "type": "debugpy",
             "request": "launch",
