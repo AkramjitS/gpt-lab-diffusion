@@ -36,7 +36,7 @@ from torch.utils.data import DataLoader
 
 @dataclass
 class Hyperparameters:
-    train_folder:str = 'experiments/20250525_225237_ModdedGPT'
+    train_folder:str = 'experiments/20250529_172823_ModdedGPT'
     checkpoint_name:str = 'state_step035000.pt'
     additional_inputs:list[str] = field(default_factory=list)
     cuda:int = 1
@@ -129,7 +129,8 @@ def get_model_tokenizer_args():
     # Handle tokenizer separately
     try:
         from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained("distilroberta-base", use_fast=True, model_max_length=args.max_seq_len)
+        #tokenizer = AutoTokenizer.from_pretrained("distilroberta-base", use_fast=True, model_max_length=args.max_seq_len)
+        tokenizer = AutoTokenizer.from_pretrained("distilroberta-base", use_fast=True, model_max_length=1024)
     except Exception as e:
         print(f"- Tokenizer distilroberta-base failed to load. Error: {e}")
         exit()
@@ -150,10 +151,7 @@ def get_model_tokenizer_args():
     model.load_state_dict(checkpoint['model'], strict = False, assign = True)
     model.to('cuda')
     model.eval()
-    
-    temp1 = 0
-    temp1 += 1
-    
+
     return model, tokenizer, args
     
 def sample_from_model(model, tokenizer, prompt, max_new_tokens=100, temperature=0.8, top_k=200):
@@ -185,4 +183,3 @@ def generate_for_prompts(model, tokenizer, args):
 if __name__ == "__main__":
     model, tokenizer, args = get_model_tokenizer_args()
     generate_for_prompts(model, tokenizer, args)
-    
