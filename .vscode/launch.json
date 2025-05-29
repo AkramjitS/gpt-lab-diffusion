@@ -43,29 +43,6 @@
               ]
         },
         {
-            "name": "old_train_diffusion",
-            "type": "debugpy",
-            "request": "launch",
-            "program": "old_train_diffusion.py",
-            "console": "integratedTerminal",
-            "args": [
-                "--train_files",
-                "data/fineweb*_train_*.bin",
-                "--val_files",
-                "data/fineweb*_val_*.bin",
-                "--train_steps",
-                "3000",
-                "--schedule",
-                "uniform",
-                "--remask",
-                "random",
-                "--seed",
-                "1103122614",
-                "--run_tag",
-                "uniform-random-rb0-sc0-r0"
-              ]
-        },
-        {
             "name": "train_gpt",
             "type": "debugpy",
             "request": "launch",

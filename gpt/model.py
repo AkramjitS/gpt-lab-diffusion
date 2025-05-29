@@ -374,9 +374,10 @@ class Diffusion(nn.Module):
         docs = (seq_src == self.bos_token_id).cumsum(0)
         def doc_causal(b, h, q_idx, kv_idx):
             same = docs[q_idx] == docs[kv_idx]
-            qm = mask[q_idx]
-            kvv = ~mask[kv_idx]
-            return torch.where(qm, kvv & same, same)
+            #qm = mask[q_idx]
+            #kvv = ~mask[kv_idx]
+            #return torch.where(qm, kvv & same, same)
+            return same
         # Because the sparsity pattern is independent of batch and heads, we'll set them to None (which broadcasts them) 
         block_mask = create_block_mask(doc_causal, B=None, H=None, Q_LEN=L, KV_LEN=L)
         

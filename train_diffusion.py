@@ -250,7 +250,7 @@ def main():
             #ids = tokenizer(example["text"], add_special_tokens=False).input_ids
             #return {"input_ids": ids + [tokenizer.eos_token_id]}
             ids = tokenizer(example["text"], add_special_tokens=True).input_ids
-            return {"input_ids": ids}  
+            return {"input_ids": ids + [tokenizer.pad_token_id] * random.randint(0, 10)} 
         # fineweb for train and validation
         try:
             ds = load_dataset(args.train_val_dataset, split="train", streaming=True)
