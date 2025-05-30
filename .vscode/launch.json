@@ -11,7 +11,8 @@
             "program": "generate.py",
             "console": "integratedTerminal",
             "args": [
-                "--checkpoint_name", "state_step002000.pt",
+                "--train_folder", "experiments/20250530_144815_ModdedGPT",
+                "--checkpoint_name", "state_step004000.pt",
 
                 "--cuda", "1",
 
@@ -30,33 +31,15 @@
             "args": [
                 "--train_seq_len", "4_096",
                 "--val_seq_len", "4_096",
-                "--train_steps", "160_000",
+                "--train_steps", "2",
                 "--grad_acc_steps", "8",
                 "--num_layers", "12",
                 "--num_heads", "6",
                 "--model_dim", "384",
                 "--save_model", "True",
-                "--hellaswag_validation", "False",
                 "--cuda", "3",
                 "--val_loss_every", "1_000", 
                 "--save_every", "2_000"
-              ]
-        },
-        {
-            "name": "train_gpt",
-            "type": "debugpy",
-            "request": "launch",
-            "program": "train_gpt.py",
-            "console": "integratedTerminal",
-            "args": [
-                "--train_seq_len", "8192",
-                "--val_seq_len", "16384",
-                "--train_steps", "3",
-                "--num_layers", "8",
-                "--num_heads", "4",
-                "--model_dim", "256",
-                "--save_model", "True",
-                "--cuda", "1"
               ]
         }
     ]

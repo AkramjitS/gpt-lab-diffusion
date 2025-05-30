@@ -22,7 +22,6 @@ import numpy as np # Import numpy for potential future use, set random seed now 
 from datasets import load_dataset
 from gpt.helper import *
 from gpt.model import *
-from gpt.hellaswag import *
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
@@ -139,10 +138,8 @@ def get_model_tokenizer_args():
     
     model: nn.Module = Diffusion(vocab_size=tokenizer.vocab_size,
         mask_token_id=tokenizer.mask_token_id,
-        #eos_token_id=tokenizer.eos_token_id,
         bos_token_id=tokenizer.bos_token_id,
         num_layers=args.num_layers,
-        num_val_emb=args.num_val_emb,
         num_heads=args.num_heads, 
         model_dim=args.model_dim,
         max_seq_len=args.max_seq_len,

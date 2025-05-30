@@ -22,7 +22,6 @@ import numpy as np # Import numpy for potential future use, set random seed now 
 from datasets import load_dataset
 from gpt.helper import *
 from gpt.model import *
-from gpt.hellaswag import *
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
@@ -43,23 +42,20 @@ class Hyperparameters:
     # data
     #train_files = "data/fineweb*_train_*.bin" # input .bin to train on
     #val_files = "data/fineweb*_val_*.bin" # input .bin to eval validation loss on
-    train_seq_len = 8*1024 # FlexAttention sequence length
-    val_seq_len = 16*1024 # FlexAttention sequence length for validation (should be able to fit more than train_seq_len)
+    train_seq_len = 4*1024 # FlexAttention sequence length
+    val_seq_len = 4*1024 # FlexAttention sequence length for validation (should be able to fit more than train_seq_len)
     # optimization loop
     val_steps = 10 # number of steps to run validation for
     train_steps = 20#_000 # number of training steps to run
     grad_acc_steps = 1 # number of gradient accumulation steps per training step
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
     # architecture
-    tokenizer = "gpt4regex_v50256_n1000000000.pkl"# any .pkl file in tokenizers/
-    #vocab_size = 50257 # should be the tokenizer's size plus any special tokens
     # model size - parameters set for GPUs w/ 8GB VRAM
     num_layers = 12  # number of reansformer blocks
     num_heads = 6   # number of attention heads
     model_dim = 384  # size of model embedding vectors
     head_dim = None  # size of attention heads; if None, will default to model_dim // num_heads
     mlp_ratio = 4  # MLP hidden dimension is model_dim * mlp_ratio
-    num_val_emb = 2 # number of value embeddings used at initial and final layers
     # memory optimization 
     use_fp8 = False # experimental; True on H100s (and newer?) should improve performance but seems to use more vram somehow
     # evaluation and logging
@@ -70,7 +66,6 @@ class Hyperparameters:
 
     # my variables
     cuda: int = 1
-    hellaswag_validation: bool = False
     num_generate_steps: int = 50
     train_val_dataset: str = "HuggingFaceFW/fineweb-edu"
     save_every: int | None = None
@@ -84,8 +79,6 @@ class Hyperparameters:
             self.head_dim = self.model_dim // self.num_heads
         assert self.head_dim in [2 ** i for i in range(1, 10)], f"head_dim must be a power of 2, got {self.head_dim}"
         assert self.mlp_ratio > 0, f"mlp_ratio must be positive, got {self.mlp_ratio}"
-        assert self.num_layers // 2 >= self.num_val_emb, \
-            f"num_layers // 2 (={self.num_layers // 2}) must be greater than or equal num_val_emb (={self.num_val_emb})"
         assert self.num_layers % 2 == 0, f"Number of layers ({self.num_layers}) must be even for skip connections"
         if self.save_every is not None:
             assert self.save_every > 0, f"save_every={self.save_every} must be a positive int"
@@ -109,14 +102,12 @@ class Hyperparameters:
         parser.add_argument('--cooldown_frac', type=float, help='Fraction of training for learning rate cooldown')
         
         # Architecture arguments
-        parser.add_argument('--tokenizer', type=str, help='Tokenizer file name in tokenizers/ directory')
         #parser.add_argument('--vocab_size', type=int, help='Vocabulary size')
         parser.add_argument('--num_layers', type=int, help='Number of transformer layers')
         parser.add_argument('--num_heads', type=int, help='Number of attention heads')
         parser.add_argument('--model_dim', type=int, help='Model embedding dimension')
         parser.add_argument('--head_dim', type=int, help='Dimension per attention head')
         parser.add_argument('--mlp_ratio', type=int, help='MLP hidden dim ratio')
-        parser.add_argument('--num_val_emb', type=int, help='Number of value embeddings used at initial and final layers')
         
         # Other options
         parser.add_argument('--use_fp8', type=lambda x: (str(x).lower() == 'true'), default=None, 
@@ -129,9 +120,6 @@ class Hyperparameters:
         # my options
         parser.add_argument('--cuda', type=int, default=0,
                             help='provide which gpu to use')
-        parser.add_argument('--hellaswag_validation', 
-                            type=lambda x: (str(x).lower() == 'true'), 
-                            help='Perform HellaSwag validation after pretraining')
         parser.add_argument('--num_generate_steps', type=int,
                             help='Maximum generatation steps')
         parser.add_argument('--train_val_dataset', type=str,
@@ -223,7 +211,7 @@ def main():
             print0(master_process, logfile, "="*100, console=True)
 
         print0(master_process, logfile, "Copying relevant files to experiment directory...")
-        files_to_copy = ["requirements.txt", sys.argv[0], "download_hellaswag.py", "download_fineweb.py"]
+        files_to_copy = ["requirements.txt", sys.argv[0], "gpt/helper.py", "gpt/model.py"]
         for file_path_str in files_to_copy:
             file_path = Path(file_path_str)
             if file_path.exists():
@@ -311,10 +299,8 @@ def main():
 
     model: nn.Module = Diffusion(vocab_size=tokenizer.vocab_size,
                         mask_token_id=tokenizer.mask_token_id,
-                        #eos_token_id=tokenizer.eos_token_id,
                         bos_token_id=tokenizer.bos_token_id,
                         num_layers=args.num_layers,
-                        num_val_emb=args.num_val_emb,
                         num_heads=args.num_heads, 
                         model_dim=args.model_dim,
                         max_seq_len=max(args.train_seq_len, args.val_seq_len),
@@ -566,15 +552,6 @@ def main():
 
     print0(master_process, logfile, f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
-
-    # After training and sample generations, evaluate on HellaSwag
-    hellaswag_path = "./data/hellaswag_val.jsonl" 
-    # Check if the HellaSwag data file exists
-    if os.path.exists(hellaswag_path) and args.hellaswag_validation:
-        print0(master_process, logfile, f"Found HellaSwag dataset at {hellaswag_path}", console=True)
-        evaluate_hellaswag(master_process, logfile, world_size, rank, args, model, hellaswag_path, limit=1014, diffusion=True) # 1014 is largest possible
-    else:
-        print0(master_process, logfile, f"HellaSwag dataset not found at {hellaswag_path}, skipping evaluation.", console=True)
 
     if world_size > 1:
         dist.destroy_process_group()
