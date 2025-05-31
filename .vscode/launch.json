@@ -5,6 +5,28 @@
     "version": "0.2.0",
     "configurations": [
         {
+            "name": "train_transcoders",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "train_transcoders.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--train_folder", "experiments/20250530_144815_ModdedGPT",
+                "--checkpoint_name", "state_step020000.pt",
+
+                "--train_seq_len", "4_096",
+                "--train_steps", "2",
+                "--grad_acc_steps", "8",
+                "--num_layers", "12",
+                "--num_heads", "6",
+                "--model_dim", "384",
+                "--save_model", "True",
+                "--cuda", "3",
+                "--val_loss_every", "1_000", 
+                "--save_every", "2_000"
+              ]
+        },
+        {
             "name": "generate",
             "type": "debugpy",
             "request": "launch",
@@ -12,7 +34,7 @@
             "console": "integratedTerminal",
             "args": [
                 "--train_folder", "experiments/20250530_144815_ModdedGPT",
-                "--checkpoint_name", "state_step004000.pt",
+                "--checkpoint_name", "state_step020000.pt",
 
                 "--cuda", "1",
 

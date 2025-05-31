@@ -177,12 +177,249 @@ class Block(nn.Module):
         x = x + self.mlp(norm(x))
         return x
     
+class _JumpReLU(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.threshold = nn.Parameter(torch.tensor(0.0))
+        
+    def forward(self, x : Tensor):
+        return (x * (x > self.threshold)).to(x)
+    
+class Transcoder(nn.Module):
+    def __init__(self, dim: int, transcoder_ratio: int, layer_idx: int):
+        super().__init__()
+        self.enc = nn.Linear(dim, transcoder_ratio * dim)
+        self.activation = _JumpReLU()
+        self.decs = nn.ModuleList([nn.Linear(transcoder_ratio * dim, dim) for _ in range(layer_idx+1)])
+        self.layer_idx = layer_idx
+        
+    def forward(self, x : Tensor, prev_activations : list[Tensor]):
+        pre_act = self.enc(x)
+        activation = self.activation(pre_act)
+        
+        # Handling that all previous transcoders have connections to the current transcoder through their decoding
+        output = self.decs[0](activation)
+        for i in range(self.layer_idx):
+            # offset on decs due to the 0th decoder being used by itself. This is a shift by one compared to the paper to be in-line
+            # with pythonic notation that starts at 0
+            output = output + self.decs[i+1](prev_activations[i])
+            
+        return activation, output
+    
+class Tracing_Block(nn.Module):
+    def __init__(self, dim: int, num_heads: int, mlp_ratio: int, max_seq_len: int, layer_idx: int):
+        super().__init__()
+        self.attn = CausalSelfAttention(dim, num_heads, max_seq_len)
+        self.mlp = MLP(dim, mlp_ratio)
+        self.lambdas = nn.Parameter(torch.tensor([1.]))
+        
+        self.transcoder = Transcoder(dim, mlp_ratio * 2, layer_idx)
+
+    def forward(self, x: Tensor, block_mask: BlockMask, prev_activations : list[Tensor]):
+        x = self.lambdas[0] * x
+        pre_mlp = x + self.attn(norm(x), block_mask)
+        
+        post_mlp = pre_mlp + self.mlp(norm(pre_mlp))
+        transcoder_activation, transcoder_output = self.transcoder(pre_mlp, prev_activations)
+
+        return post_mlp, transcoder_activation, transcoder_output
+    
 # -----------------------------------------------------------------------------
 # The main model
 
 def next_multiple_of_n(v: float | int, *, n: int):
     #return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
     return (-v % n) + v
+
+class Tracing_Diffusion(nn.Module):
+    def __init__(
+        self, 
+        vocab_size: int, 
+        mask_token_id: int, 
+        bos_token_id: int,
+        num_layers: int, 
+        num_heads: int, 
+        model_dim: int, 
+        max_seq_len: int, 
+        mlp_ratio: int,
+        num_steps: int
+    ):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.mask_token_id = mask_token_id
+        self.bos_token_id = bos_token_id
+        self.model_dim = model_dim
+        self.max_seq_len = max_seq_len
+        self.num_steps = num_steps
+        
+        self.embed = nn.Embedding(vocab_size, model_dim)
+        # sinusoidal time embedding + MLP
+        self.time_emb = nn.Sequential(
+            SinusoidalTimeEmb(model_dim),
+            nn.Linear(model_dim, model_dim),
+            SquareReLU(),
+            nn.Linear(model_dim, model_dim)
+        )
+        
+        self.blocks = nn.ModuleList([Tracing_Block(model_dim, num_heads, mlp_ratio, max_seq_len, i) for i in range(num_layers)])
+        # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
+        # suggested by @Grad62304977. this originates from Karpathy's experiments.
+        self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128),
+                                    use_fp8=False, x_s=(model_dim**0.5)/448, w_s=24/448, grad_s=1/448)
+        self.lm_head.weight.detach().zero_() # @Grad62304977
+        
+    def get_p_mask(self, t: Tensor) -> Tensor:
+        # linear mask schedule from 0 to 1 over num_steps
+        return (1 - 1e-10) * (t.float() / (self.num_steps - 1)) + 1e-10
+
+    def forward(
+        self, 
+        input_seq: Tensor, 
+        t: Tensor,
+        target_seq: Tensor = None,
+        mask: Tensor = None
+    ) -> Tensor:
+        assert input_seq.ndim == 1 # shape (B*N)
+        device = input_seq.device
+        L = input_seq.size(0)
+        
+        # sample mask and ensure at least one masked token
+        if mask is None or target_seq is not None:
+            p_mask = self.get_p_mask(t)
+            mask = torch.rand(L, device=device) < p_mask
+            if not mask.any():
+                mask[torch.randint(high=L, size=(1,), device=device)] = True
+        else:
+            p_mask = None
+
+        # creating flex-attentio mask
+        seq_src = target_seq if target_seq is not None else input_seq
+        docs = (seq_src == self.bos_token_id).cumsum(0)
+        def doc_causal(b, h, q_idx, kv_idx):
+            same = docs[q_idx] == docs[kv_idx]
+            #qm = mask[q_idx]
+            #kvv = ~mask[kv_idx]
+            #return torch.where(qm, kvv & same, same)
+            return same
+        # Because the sparsity pattern is independent of batch and heads, we'll set them to None (which broadcasts them) 
+        block_mask = create_block_mask(doc_causal, B=None, H=None, Q_LEN=L, KV_LEN=L)
+        
+        # compute time embedding
+        te = self.time_emb(t).view(1, 1, -1)
+
+        x = norm(self.embed(input_seq)[None]) # use of norm here by @Grad62304977
+        x += te
+
+        loss = None
+        prev_transcoder_activations = []
+        for i in range(len(self.blocks)):
+            mlp_output, transcoder_activation, transcoder_output = self.blocks[i](x, block_mask, prev_transcoder_activations)
+            prev_transcoder_activations.append(transcoder_activation.clone())
+            if loss is not None:
+                loss = loss + F.mse_loss(transcoder_output, mlp_output)
+            else:
+                loss = F.mse_loss(transcoder_output, mlp_output)
+            x = mlp_output
+
+        x = norm(x)
+        logits = self.lm_head(x).float()
+        # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
+        logits = 30 * torch.sigmoid(logits / (7.5 * x.size(-1)**0.5))
+
+        return logits, loss
+        
+        #if target_seq is None:
+        #    return logits
+        
+        #loss = F.cross_entropy(
+        #    logits.view(-1, logits.size(-1)), 
+        #    target_seq.to(torch.int64).view(-1), 
+        #    reduction="none"
+        #)
+
+        #return loss[mask].sum() / mask.sum().clamp_min(1)
+
+    def get_num_params(self):
+        """
+        Return the number of parameters in the model.
+        """
+        n_params = sum(p.numel() for p in self.parameters())
+        return n_params
+
+    @torch.no_grad()
+    def generate(
+        self, 
+        input_seq, 
+        max_new_tokens, 
+        temperature=1.0, 
+        top_k=None
+    ) -> Tensor:
+        """
+        Take a conditioning sequence of indices idx (LongTensor of shape (t)) and complete
+        the sequence max_new_tokens times, feeding the predictions back into the model each time.
+        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+        """
+        assert input_seq.ndim == 1
+        def cdiv(m, n):
+            return (m + (n - 1)) // n
+        
+        device = input_seq.device
+        seq_len = input_seq.size(0)
+        mask_append_seq = torch.full((max_new_tokens,), fill_value=self.mask_token_id, dtype=input_seq.dtype, device=input_seq.device)
+        masked_seq = torch.cat([input_seq, mask_append_seq], dim=0)
+        masked_len = masked_seq.size(0)
+        pad_ct = (-masked_len) % 128
+        if pad_ct:
+            masked_seq = torch.cat((masked_seq, torch.zeros(pad_ct, dtype=masked_seq.dtype, device=device)), dim=0)
+        if masked_seq.size(0) > self.max_seq_len:
+            masked_seq = masked_seq[:self.max_seq_len]
+        
+        self.eval()  # Ensure model is in evaluation mode
+        mask = masked_seq[:masked_len] == self.mask_token_id
+        
+        outputs = [masked_seq[:masked_len].clone()]
+        for t_id in range(self.num_steps - 1, -1, -1):
+            # 1) Reset only currently masked positions
+            masked_seq[:masked_len][mask] = self.mask_token_id
+
+            # 2) Forward pass (batch size 1)
+            t = torch.tensor([t_id], device=device)
+            logits = self.forward(masked_seq[:masked_len], t, mask=mask)  # (1, L, V)
+
+            # 3) Gather logits at current mask positions
+            logits = logits[0, mask, :] / temperature
+
+            # 4) Optionally top-k filter (unchanged)
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, -1].unsqueeze(1)] = -float('Inf')
+
+            # 5) Sample
+            probs = F.softmax(logits, dim=-1)
+            sampled_ids = torch.multinomial(probs, 1).squeeze(1)
+
+            # 6) Update only masked positions
+            positions = torch.nonzero(mask, as_tuple=False).squeeze(1)
+            masked_seq[positions] = sampled_ids.to(masked_seq.dtype)
+
+            outputs.append(masked_seq[:masked_len].clone())
+            if t_id == 0:
+                break
+
+            # 7) Rebuild dynamic mask for next iteration (your existing logic)
+            confidences = torch.gather(probs, 1, sampled_ids.unsqueeze(1)).squeeze(1)
+            p_mask = self.get_p_mask(torch.tensor([t_id - 1], device=device))
+            rand_mask = torch.rand(sampled_ids.size(0), device=device) < p_mask
+            keep_high = confidences >= 0.5
+            new_cont_mask = (~keep_high) & rand_mask
+
+            mask[:] = False
+            mask[positions] = new_cont_mask
+
+            if torch.all(~mask[seq_len:masked_len]):
+                break
+
+        return outputs
     
 class Diffusion(nn.Module):
     def __init__(

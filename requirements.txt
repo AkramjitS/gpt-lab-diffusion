@@ -6,3 +6,4 @@ tiktoken==0.9.0
 torch==2.6.0
 tqdm==4.66.5
 transformers==4.51.3
+transformer-lens==2.15.4
