@@ -325,7 +325,7 @@ def main():
     #for k, v in model.state_dict().items():
     for k, v in model.named_parameters():
         if k in checkpoint:
-            v.data = checkpoint[k].clone()
+            v.data.copy_(checkpoint[k].data)
             v.requires_grad_(False)
         else:
             v.requires_grad_(True)

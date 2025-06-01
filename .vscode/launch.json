@@ -21,7 +21,7 @@
                 "--num_heads", "6",
                 "--model_dim", "384",
                 "--save_model", "True",
-                "--cuda", "3",
+                "--cuda", "1",
                 "--val_loss_every", "1_000", 
                 "--save_every", "2_000"
               ]
