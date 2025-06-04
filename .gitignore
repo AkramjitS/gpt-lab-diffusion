@@ -3,9 +3,15 @@ pylog124M/
 __pycache__/
 venv/
 *.pt
-tokenizers/readmetokenizer_v1000_n100000.pkl
 experiments/*_ReadmeGPT/
+*_ReadmeGPT/
 experiments/*_ModdedGPT/
 *_ModdedGPT/
+experiments/*_TranscoderGPT/
+*_TranscoderGPT/
+experiments/*_TopKGPT/
+*_TopKGPT/
+experiments/*_ActivationDescriptionGPT/
+*_ActivationDescriptionGPT/
 train.log
 scratch.py

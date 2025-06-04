@@ -5,13 +5,75 @@
     "version": "0.2.0",
     "configurations": [
         {
+            "name": "generate_descriptions",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "generate_descriptions.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--train_folder", "experiments/20250603_131541_ActivationDescriptionGPT",
+                "--checkpoint_name", "state_step001000.pt",
+
+                "--cuda", "1",
+
+                "--num_layers", "12",
+                "--num_heads", "6",
+                "--model_dim", "384",
+                "--max_seq_len", "4_096"
+              ]
+        },
+        {
+            "name": "get_activation_descriptions",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "get_activation_descriptions.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--train_folder", "experiments/20250602_155455_TopKGPT",
+                "--checkpoint_name", "state_step001000.pt",
+
+                "--train_seq_len", "4_096",
+                "--train_steps", "2",
+                "--grad_acc_steps", "8",
+                "--num_layers", "12",
+                "--num_heads", "6",
+                "--model_dim", "384",
+                "--save_model", "True",
+                "--cuda", "1",
+                "--val_loss_every", "1_000", 
+                "--save_every", "2_000"
+              ]
+        },
+        {
+            "name": "get_topk_activations",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "get_topk_activations.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--train_folder", "experiments/20250602_004412_TranscoderGPT",
+                "--checkpoint_name", "state_step020000.pt",
+
+                "--train_seq_len", "4_096",
+                "--train_steps", "2",
+                "--grad_acc_steps", "8",
+                "--num_layers", "12",
+                "--num_heads", "6",
+                "--model_dim", "384",
+                "--save_model", "True",
+                "--cuda", "1",
+                "--val_loss_every", "1_000", 
+                "--save_every", "2_000"
+              ]
+        },
+        {
             "name": "train_transcoders",
             "type": "debugpy",
             "request": "launch",
             "program": "train_transcoders.py",
             "console": "integratedTerminal",
             "args": [
-                "--train_folder", "experiments/20250530_144815_ModdedGPT",
+                "--train_folder", "experiments/20250531_234706_ModdedGPT",
                 "--checkpoint_name", "state_step020000.pt",
 
                 "--train_seq_len", "4_096",
@@ -33,15 +95,15 @@
             "program": "generate.py",
             "console": "integratedTerminal",
             "args": [
-                "--train_folder", "experiments/20250530_144815_ModdedGPT",
+                "--train_folder", "experiments/20250531_234706_ModdedGPT",
                 "--checkpoint_name", "state_step020000.pt",
 
                 "--cuda", "1",
 
-                "--num_layers", "8",
-                "--num_heads", "4",
-                "--model_dim", "256",
-                "--max_seq_len", "11264"
+                "--num_layers", "12",
+                "--num_heads", "6",
+                "--model_dim", "384",
+                "--max_seq_len", "4_096"
               ]
         },
         {

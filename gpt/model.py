@@ -1,5 +1,5 @@
 import torch
-torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
+#torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
 from torch import Tensor, nn
 import torch.nn.functional as F
 import torch.distributed as dist
@@ -90,10 +90,6 @@ mm_op.register_autograd(backward, setup_context=setup_context)
 # PyTorch nn.Module definitions for the model
 
 # -----------------------------------------------------------------------------
-# Activation: ReLU squared
-class SquareReLU(nn.Module):
-    def forward(self, x: Tensor) -> Tensor:
-        return F.relu(x).square()
 
 # -----------------------------------------------------------------------------
 # Sinusoidal positional embedding for timesteps
@@ -154,13 +150,13 @@ class MLP(nn.Module):
         super().__init__()
         hdim = int(mlp_ratio * dim)
         self.c_fc = CastedLinear(dim, hdim)
-        self.squared_relu = SquareReLU()
+        self.activation = nn.ReLU()
         self.c_proj = CastedLinear(hdim, dim)
         self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
 
     def forward(self, x: Tensor):
         x = self.c_fc(x)
-        x = self.squared_relu(x) # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
+        x = self.activation(x) # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
         x = self.c_proj(x)
         return x
 
@@ -177,32 +173,26 @@ class Block(nn.Module):
         x = x + self.mlp(norm(x))
         return x
     
-class _JumpReLU(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.threshold = nn.Parameter(torch.tensor(0.0))
-        
-    def forward(self, x : Tensor):
-        return (x * (x > self.threshold)).to(x)
-    
 class Transcoder(nn.Module):
     def __init__(self, dim: int, transcoder_ratio: int, layer_idx: int):
         super().__init__()
         self.enc = nn.Linear(dim, transcoder_ratio * dim)
-        self.activation = _JumpReLU()
-        self.decs = nn.ModuleList([nn.Linear(transcoder_ratio * dim, dim) for _ in range(layer_idx+1)])
+        self.activation = nn.ReLU()
+        #self.decs = nn.ModuleList([nn.Linear(transcoder_ratio * dim, dim) for _ in range(layer_idx+1)])
+        self.dec = nn.Linear(transcoder_ratio * dim, dim)
         self.layer_idx = layer_idx
         
-    def forward(self, x : Tensor, prev_activations : list[Tensor]):
+    def forward(self, x : Tensor):
         pre_act = self.enc(x)
         activation = self.activation(pre_act)
         
+        output = self.dec(activation)
         # Handling that all previous transcoders have connections to the current transcoder through their decoding
-        output = self.decs[0](activation)
-        for i in range(self.layer_idx):
-            # offset on decs due to the 0th decoder being used by itself. This is a shift by one compared to the paper to be in-line
-            # with pythonic notation that starts at 0
-            output = output + self.decs[i+1](prev_activations[i])
+        #output = self.decs[0](activation)
+        #for i in range(self.layer_idx):
+        #    # offset on decs due to the 0th decoder being used by itself. This is a shift by one compared to the paper to be in-line
+        #    # with pythonic notation that starts at 0
+        #    output = output + self.decs[i+1](prev_activations[i])
             
         return activation, output
     
@@ -215,12 +205,12 @@ class Tracing_Block(nn.Module):
         
         self.transcoder = Transcoder(dim, mlp_ratio * 2, layer_idx)
 
-    def forward(self, x: Tensor, block_mask: BlockMask, prev_activations : list[Tensor]):
+    def forward(self, x: Tensor, block_mask: BlockMask):
         x = self.lambdas[0] * x
         pre_mlp = x + self.attn(norm(x), block_mask)
         
         post_mlp = pre_mlp + self.mlp(norm(pre_mlp))
-        transcoder_activation, transcoder_output = self.transcoder(pre_mlp, prev_activations)
+        transcoder_activation, transcoder_output = self.transcoder(pre_mlp)
 
         return post_mlp, transcoder_activation, transcoder_output
     
@@ -257,7 +247,7 @@ class Tracing_Diffusion(nn.Module):
         self.time_emb = nn.Sequential(
             SinusoidalTimeEmb(model_dim),
             nn.Linear(model_dim, model_dim),
-            SquareReLU(),
+            nn.ReLU(),
             nn.Linear(model_dim, model_dim)
         )
         
@@ -278,7 +268,7 @@ class Tracing_Diffusion(nn.Module):
         t: Tensor,
         target_seq: Tensor = None,
         mask: Tensor = None
-    ) -> Tensor:
+    ) -> tuple[Tensor, Tensor, list[Tensor]]:
         assert input_seq.ndim == 1 # shape (B*N)
         device = input_seq.device
         L = input_seq.size(0)
@@ -311,10 +301,10 @@ class Tracing_Diffusion(nn.Module):
         x += te
 
         loss = None
-        prev_transcoder_activations = []
+        transcoder_activations = []
         for i in range(len(self.blocks)):
-            mlp_output, transcoder_activation, transcoder_output = self.blocks[i](x, block_mask, prev_transcoder_activations)
-            prev_transcoder_activations.append(transcoder_activation.clone())
+            mlp_output, transcoder_activation, transcoder_output = self.blocks[i](x, block_mask)
+            transcoder_activations.append(transcoder_activation)
             if loss is not None:
                 loss = loss + F.mse_loss(transcoder_output, mlp_output)
             else:
@@ -326,7 +316,7 @@ class Tracing_Diffusion(nn.Module):
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
         logits = 30 * torch.sigmoid(logits / (7.5 * x.size(-1)**0.5))
 
-        return logits, loss
+        return logits, loss, transcoder_activations
         
         #if target_seq is None:
         #    return logits
@@ -353,7 +343,7 @@ class Tracing_Diffusion(nn.Module):
         max_new_tokens, 
         temperature=1.0, 
         top_k=None
-    ) -> Tensor:
+    ) -> list[tuple[Tensor, list[Tensor] | None]]:
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
@@ -377,14 +367,14 @@ class Tracing_Diffusion(nn.Module):
         self.eval()  # Ensure model is in evaluation mode
         mask = masked_seq[:masked_len] == self.mask_token_id
         
-        outputs = [masked_seq[:masked_len].clone()]
+        outputs = [(masked_seq[:masked_len].clone(), None)]
         for t_id in range(self.num_steps - 1, -1, -1):
             # 1) Reset only currently masked positions
             masked_seq[:masked_len][mask] = self.mask_token_id
 
             # 2) Forward pass (batch size 1)
             t = torch.tensor([t_id], device=device)
-            logits = self.forward(masked_seq[:masked_len], t, mask=mask)  # (1, L, V)
+            logits, loss, activations = self.forward(masked_seq[:masked_len], t, mask=mask)  # (1, L, V)
 
             # 3) Gather logits at current mask positions
             logits = logits[0, mask, :] / temperature
@@ -402,7 +392,8 @@ class Tracing_Diffusion(nn.Module):
             positions = torch.nonzero(mask, as_tuple=False).squeeze(1)
             masked_seq[positions] = sampled_ids.to(masked_seq.dtype)
 
-            outputs.append(masked_seq[:masked_len].clone())
+            activations = [activation.clone() for activation in activations]
+            outputs.append((masked_seq[:masked_len].clone(), activations))
             if t_id == 0:
                 break
 
@@ -447,7 +438,7 @@ class Diffusion(nn.Module):
         self.time_emb = nn.Sequential(
             SinusoidalTimeEmb(model_dim),
             nn.Linear(model_dim, model_dim),
-            SquareReLU(),
+            nn.ReLU(),
             nn.Linear(model_dim, model_dim)
         )
         
@@ -533,7 +524,7 @@ class Diffusion(nn.Module):
         max_new_tokens, 
         temperature=1.0, 
         top_k=None
-    ) -> Tensor:
+    ) -> list[Tensor]:
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.

@@ -25,7 +25,7 @@ from gpt.model import *
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
-torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
+#torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
 from torch import Tensor, nn
 import torch.nn.functional as F
 import torch.distributed as dist
@@ -404,7 +404,7 @@ def main():
             #torch.compiler.cudagraph_mark_step_begin()
                 # TODO why does un-commenting this^ line throw an error here in the warmup but not down in training?
             t = torch.randint(0, model.num_steps, (1,), device='cuda')
-            logits, step_loss = model(inputs.to(torch.int32), t, targets)
+            logits, step_loss, transcoder_activations = model(inputs.to(torch.int32), t, targets)
             loss += step_loss / args.grad_acc_steps
         loss.backward()
         if world_size > 1:
@@ -464,7 +464,7 @@ def main():
             t = torch.randint(0, model.num_steps, (1,), device='cuda')
             
             torch.compiler.cudagraph_mark_step_begin()
-            logits, step_loss = model(
+            logits, step_loss, transcoder_activations = model(
                 inputs,
                 t,
                 inputs

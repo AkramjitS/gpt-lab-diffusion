@@ -20,7 +20,7 @@ import math
 import numpy as np # Import numpy for potential future use, set random seed now not to forget to set it later
 
 import torch
-torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
+#torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
 from torch import Tensor, nn
 import torch.nn.functional as F
 import torch.distributed as dist

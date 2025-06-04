@@ -33,17 +33,20 @@ from torch.nn.attention.flex_attention import BlockMask, flex_attention, create_
 from torch.utils.data import DataLoader
 #torch._inductor.config.max_autotune_gemm_backends = ["ATEN"]
 
+from transformers import T5Tokenizer, T5ForConditionalGeneration
+
 @dataclass
 class Hyperparameters:
     """
     default values are set to fit on a 2x GPUs w/ 8GB of VRAM each, but are not necessarily optimal
     """
-    model_name = "ModdedGPT"
+    train_folder:str = 'experiments/20250529_172823_ModdedGPT'
+    checkpoint_name:str = 'state_step035000.pt'
+    model_name = "ActivationDescriptionGPT"
     # data
     #train_files = "data/fineweb*_train_*.bin" # input .bin to train on
     #val_files = "data/fineweb*_val_*.bin" # input .bin to eval validation loss on
     train_seq_len = 4*1024 # FlexAttention sequence length
-    val_seq_len = 4*1024 # FlexAttention sequence length for validation (should be able to fit more than train_seq_len)
     # optimization loop
     val_steps = 10 # number of steps to run validation for
     train_steps = 20#_000 # number of training steps to run
@@ -70,10 +73,12 @@ class Hyperparameters:
     train_val_dataset: str = "HuggingFaceFW/fineweb-edu"
     save_every: int | None = None
 
+    # top_k specific variable
+    top_k: int = 50
+
     def __post_init__(self):
         # Validate and set derived parameters
         assert self.train_seq_len % 128 == 0, f"train_seq_len must be multiple of 128, got {self.train_seq_len}"
-        assert self.val_seq_len % 128 == 0, f"val_seq_len must be multiple of 128, got {self.val_seq_len}"
         assert self.grad_acc_steps >= 1, f"grad_acc steps must be int >= 1"
         if self.head_dim is None:
             self.head_dim = self.model_dim // self.num_heads
@@ -89,11 +94,11 @@ class Hyperparameters:
         """Create Hyperparameters from command-line arguments."""
         parser = argparse.ArgumentParser(description="Train a GPT model with customizable hyperparameters")
         
+        parser.add_argument('--train_folder', type=str, help='The folder where the model checkpoint exists')
+        parser.add_argument('--checkpoint_name', type=str, help='The checkpoint name in the train_folder')
+        
         # Data arguments
-        #parser.add_argument('--train_files', type=str, help='Pattern for training data files')
-        #parser.add_argument('--val_files', type=str, help='Pattern for validation data files')
         parser.add_argument('--train_seq_len', type=int, help='Training sequence length')
-        parser.add_argument('--val_seq_len', type=int, help='Validation sequence length')
         
         # Optimization arguments
         parser.add_argument('--val_steps', type=int, help='Number of steps to run validation for')
@@ -126,6 +131,8 @@ class Hyperparameters:
                             help='Dataset to load from HuggingFace for train and validation')
         parser.add_argument('--save_every', type=int,
                             help="save_every must be a postive int and a multiple of val_loss_every")
+        parser.add_argument('--top_k', type=int,
+                            help="how many values in the transcoders to record")
         
         args = parser.parse_args()
         
@@ -231,9 +238,7 @@ def main():
             tokenizer = AutoTokenizer.from_pretrained("distilroberta-base", use_fast=True, model_max_length=args.train_seq_len)
         except Exception as e:
             print0(master_process, logfile, f"- Tokenizer distilroberta-base failed to load. Error: {e}")
-           
-        assert args.train_seq_len == args.val_seq_len, f"Currenty require that train_seq_len equals val_seq_len for dataset loader"
-           
+              
         def preprocess(example):
             #ids = tokenizer(example["text"], add_special_tokens=False).input_ids
             #return {"input_ids": ids + [tokenizer.eos_token_id]}
@@ -294,18 +299,18 @@ def main():
             # torch.backends.cudnn.benchmark = False
 
     ########################################
-    #    Construct model and optimizer     #
+    #    Construct model                   #
     ########################################
 
-    model: nn.Module = Diffusion(vocab_size=tokenizer.vocab_size,
+    model: nn.Module = Tracing_Diffusion(vocab_size=tokenizer.vocab_size,
                         mask_token_id=tokenizer.mask_token_id,
                         bos_token_id=tokenizer.bos_token_id,
                         num_layers=args.num_layers,
                         num_heads=args.num_heads, 
                         model_dim=args.model_dim,
-                        max_seq_len=max(args.train_seq_len, args.val_seq_len),
+                        max_seq_len=args.train_seq_len,
                         mlp_ratio=args.mlp_ratio,
-                        num_steps=args.num_generate_steps).cuda()
+                        num_steps=args.num_generate_steps)
     print0(master_process, logfile, f'{model.get_num_params()} parameters', console=True)
     print0(master_process, logfile, model)
 
@@ -313,47 +318,27 @@ def main():
     #model.lm_head.use_fp8 = args.use_fp8
 
     for m in model.modules():
-        if isinstance(m, nn.Embedding):
+        if isinstance(m, nn.Embedding) or isinstance(m, Transcoder):
             m.bfloat16()
     if world_size > 1:
         for param in model.parameters():
             dist.broadcast(param.detach(), 0)
 
-    # collect the parameters to optimize
-    hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
-    embed_params = [p for n, p in model.named_parameters() if "embed" in n]
-    scalar_params = [p for p in model.parameters() if p.ndim < 2]
-    head_params = [model.lm_head.weight]
+    checkpoint = torch.load(args.train_folder + '/' + args.checkpoint_name)
+    # create descriptions target
+    top_k_activations = [top_k.tolist() for top_k in checkpoint['top_k_activations']]
+    descriptions = {index : {pos : [] for pos in top_k} for index, top_k in enumerate(top_k_activations)}
+    
+    # setup model with parameters from checkpoint
+    checkpoint = checkpoint['model']
+    # the old model was saved compiled so we need to extract it according to the format expected in the model here, without the compiled name
+    checkpoint = {k.split('.', 1)[1] : v for k, v in checkpoint.items()}
 
-    # init the optimizer(s)
-    adam_params = [dict(params=head_params, lr=0.22), dict(params=embed_params, lr=0.6), dict(params=scalar_params, lr=0.04)]
-    # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
-    # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
-    optimizer1 = torch.optim.Adam(adam_params, betas=(0.8, 0.95), eps=1e-10, fused=True)
-
-    # For single GPU case, we need to modify how Muon is initialized
-    if world_size == 1:
-        # Create update buffer for single GPU
-        for param in hidden_matrix_params:
-            param.requires_grad_(True)
-        optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size)
-    else:
-        optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size)
-
-    optimizers = [optimizer1, optimizer2]
-    for opt in optimizers:
-        for group in opt.param_groups:
-            group["initial_lr"] = group["lr"]
-
-    # learning rate schedule: stable then decay
-    def get_lr(step: int):
-        x = step / args.train_steps # progress in training
-        assert 0 <= x < 1
-        if x < 1 - args.cooldown_frac:
-            return 1.0
-        else:
-            w = (1 - x) / args.cooldown_frac
-            return w * 1.0 + (1 - w) * 0.1
+    #for k, v in model.state_dict().items():
+    for k, v in model.named_parameters():
+        v.data.copy_(checkpoint[k].data)
+        v.requires_grad_(False)
+    model = model.cuda()
 
     # Add fallback mode to handle compilation errors
     from torch import _dynamo
@@ -364,6 +349,20 @@ def main():
         model: nn.Module = torch.compile(model, dynamic=False)
     else:
         model: nn.Module = torch.compile(model, dynamic=False, mode="reduce-overhead")
+        
+    model.zero_grad(set_to_none=True)
+
+    model = model.eval()
+    
+    ########################################
+    #    Setup model to get descriptions   #
+    ########################################
+    
+    desc_tokenizer = T5Tokenizer.from_pretrained("google/flan-t5-xxl", model_max_length=args.train_seq_len)
+    desc_model = T5ForConditionalGeneration.from_pretrained("google/flan-t5-xxl", load_in_8bit=True)
+    # already loaded into cuda and applying .cuda() throws an error. 
+    #desc_model = desc_model.cuda()
+    desc_model = desc_model.eval()
 
     ########################################
     #            Warmup kernels            #
@@ -375,41 +374,11 @@ def main():
     if hasattr(torch.cuda, 'memory_stats'):
         print0(master_process, logfile, f"Initial GPU memory: {torch.cuda.memory_allocated() // (1024 * 1024)} MB")
 
-    # Warmup the training kernels, then re-initialize the state so we aren't cheating
-    warmup_steps = 10
-    initial_state = dict(model=copy.deepcopy(model.state_dict()),
-                        optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
-    for _ in range(warmup_steps):
-        loss = torch.tensor([0.], device="cuda")
-        for _ in range(args.grad_acc_steps):
-            inputs = targets = torch.randint(0, tokenizer.vocab_size, size=(args.train_seq_len,), device="cuda", dtype=torch.int64)
-            #torch.compiler.cudagraph_mark_step_begin()
-                # TODO why does un-commenting this^ line throw an error here in the warmup but not down in training?
-            t = torch.randint(0, model.num_steps, (1,), device='cuda')
-            step_loss = model(inputs.to(torch.int32), t, targets)
-            loss += step_loss / args.grad_acc_steps
-        loss.backward()
-        if world_size > 1:
-            for param in model.parameters():
-                dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
-        for opt in optimizers:
-            opt.step()
-        model.zero_grad(set_to_none=True)
-    model.load_state_dict(initial_state["model"])
-    for opt, opt_state in zip(optimizers, initial_state["optimizers"]):
-        opt.load_state_dict(opt_state)
-    del initial_state # TODO optionally save initial state of model jic someone wants to test different seeds
-
-    if hasattr(torch.cuda, 'memory_stats'):
-        print0(master_process, logfile, f"After warmup GPU memory: {torch.cuda.memory_allocated() // (1024 * 1024)} MB")
-
     print0(master_process, logfile, "kernels are toasty", console=True)
 
     ########################################
     #        Training and validation       #
     ########################################
-
-    #train_loader = distributed_data_generator(master_process, logfile, args, args.train_files, world_size * args.train_seq_len, rank, world_size, diffusion=True)
     train_loader = make_val_loader(all_chunks, ds, args.train_seq_len, args.val_steps, True)
     train_iter = iter(train_loader)
 
@@ -417,67 +386,66 @@ def main():
     # start the clock
     torch.cuda.synchronize()
     t0 = time.perf_counter()
+    #model.train()
     # begin training
     for step in range(args.train_steps + 1):
         last_step = (step == args.train_steps)
 
-        # --------------- VALIDATION SECTION -----------------
+        # --------------- CHECKPOINT SECTION -----------------
         if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
-            # stop the clock
-            torch.cuda.synchronize()
-            # Note: training_time_ms accumulates *only* the time spent in the training loop
-            # It does not include time spent in validation or other operations outside the loop
-            training_time_ms += 1000 * (time.perf_counter() - t0)
-            
-            model.eval()
-            
-            # Ensure we validate on enough tokens while keeping memory usage reasonable
-            val_batch_size = world_size * args.val_seq_len
-            val_tokens_used = val_batch_size * args.val_steps
-            print0(master_process, logfile, f"Validating on {val_tokens_used} tokens ({args.val_steps} steps with {val_batch_size} batch size)", console=True)
-            
-            #val_loader = distributed_data_generator(master_process, logfile, args, args.val_files, val_batch_size, rank, world_size, print_stats=False, diffusion=True)
-            val_loader = make_val_loader(all_chunks, ds, args.train_seq_len, args.val_steps, False)
-            val_iter = iter(val_loader)
-            val_loss = 0
-            # TODO modify for validation
-            with torch.no_grad():
-                for i in range(args.val_steps):
-                    inputs = torch.tensor(next(val_iter)['input_ids'], device='cuda')
-                    B = inputs.size(0)
-                    # Check if inputs exceed sequence length
-                    if B > args.val_seq_len:
-                        inputs = inputs[:args.val_seq_len]
-                    t = torch.randint(0, model.num_steps, (1,), device='cuda')
-                    val_loss += model(
-                        inputs,
-                        t, 
-                        inputs
-                    )
-            val_loss /= args.val_steps
-            #del val_loader
-            if world_size > 1:
-                dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-            
-            # Calculate average time per step up to this point
-            step_avg_ms = training_time_ms / max(step, 1) 
-            print0(master_process, logfile, f"step:{step}/{args.train_steps} val_loss:{val_loss:.4e} "
-                    f"train_time:{training_time_ms:.0f}ms step_avg:{step_avg_ms:.2f}ms", console=True)
-            
-            # Log validation metrics to CSV
-            if master_process and metrics_csv_path:
-                with open(metrics_csv_path, 'a', newline='') as csvfile:
-                    writer = csv.writer(csvfile)
-                    # Use .item() to get float from tensor for val_loss
-                    writer.writerow([step, 
-                        "val", f"{val_loss.item():.4f}", 
-                        f"{training_time_ms:.0f}", 
-                        f"{step_avg_ms:.2f}"])
-
             if last_step or (step != 0 and args.save_every is not None and step % args.save_every == 0): # inside validation section to avoid the if check every training iteration
                 # 5. Save model checkpoint inside the experiment directory
                 if master_process and args.save_model and experiment_dir_path:
-                    log = dict(step=step, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
+                    top_k_descriptions = {layer : {pos : None for pos in features.keys()} for layer, features in descriptions.items()}
+                    #pre_prompt = (
+                    #    "You will recieve 10 text fragments and your job is to find the key point that connects them all"
+                    #    " and then provide that in a minimal length response of no more than 10 words.\n"
+                    #    "It cannot be a substring from one of the text fragments. It must be a genuine understanding of the key points.\n"
+                    #    "Here is an example input that only has one text fragment:\n1. input=\"This is an example input\"\n"
+                    #    "That is the format the text fragments will be in. Now, here are the text fragments:"
+                    #)
+                    pre_prompt = (
+                        "Identify the single unifying theme among these ten fragments.\n"
+                        "- Do not copy or quote any phrase verbatim—use your own wording.\n"
+                        "- Your answer must be a genuine synthesis (not a substring of any input).\n"
+                        "- Use no more than ten words total.\n"
+                        "- Output exactly in this format: response=<your answer>\n"
+                        "\nFragments:\n"
+                    )
+                    #post_prompt = (
+                    #    "Now that you have reviewed the 10 text fragments, now give me the minimal length response in the following format:\n"
+                    #    "response=This is my minimal length response\nNow that you have the response format, give me the repsponse:\nresponse="
+                    #)
+                    post_prompt = (
+                        "\nresponse="
+                    )
+                    initial_time = time.perf_counter()
+                    for layer, features in descriptions.items():
+                        t0 = time.perf_counter()
+                        for pos, features_descriptions in features.items():
+                            description_tensors = [pair[1] for pair in features_descriptions]
+                            assert len(description_tensors) == 10, "Number of descriptions to use must match our expectation"
+                            intermediate_prompt = ""
+                            for current_index, current_tensor in enumerate(description_tensors):
+                                intermediate_prompt = intermediate_prompt + f"{current_index + 1}. input=\"{tokenizer.decode(current_tensor.tolist(), skip_special_tokens=True)}\"\n"
+                            complete_prompt = pre_prompt + intermediate_prompt + post_prompt
+                            t5_input = desc_tokenizer(complete_prompt).input_ids
+                            t5_output = desc_model.generate(torch.tensor([t5_input], device='cuda'))
+                            t5_output_plaintext = desc_tokenizer.decode(t5_output[0], skip_special_tokens=True)
+                            top_k_descriptions[layer][pos] = t5_output_plaintext
+                        tf = time.perf_counter()
+                        time_passed = 1000 * (tf - t0) 
+                        time_passed_total = 1000 * (tf - initial_time) 
+                        print0(master_process, logfile, f"Generating description: Layer: {layer}, total time passed: {time_passed_total}, layer time passed: {time_passed}", console=True)
+
+                    checkpoint = torch.load(args.train_folder + '/' + args.checkpoint_name)
+                    log = dict(
+                        step=step, 
+                        model=checkpoint['model'], 
+                        optimizers=checkpoint['optimizers'], 
+                        top_k_activations=checkpoint['top_k_activations'],
+                        top_k_descriptions=top_k_descriptions
+                    )
                     # Ensure experiment_dir_path exists (though it should from earlier)
                     os.makedirs(experiment_dir_path, exist_ok=True)
                     save_path = experiment_dir_path / f"state_step{step:06d}.pt"
@@ -486,44 +454,68 @@ def main():
                 # the last step only has the validation loop, so break to avoid training
                 if last_step:
                     break
-            
-            model.train()
-            # start the clock again for the next training segment
-            torch.cuda.synchronize()
-            t0 = time.perf_counter()
 
         # --------------- TRAINING SECTION -----------------
         loss = torch.tensor([0.], device="cuda")
         for _ in range(args.grad_acc_steps):
-            inputs = torch.tensor(next(train_iter)['input_ids'], device='cuda')
-            B = inputs.size(0)
-            # Check if inputs exceed sequence length - can happen if the dataset has different sized examples
-            if B > args.train_seq_len:
-                inputs = inputs[:args.train_seq_len]
-            t = torch.randint(0, model.num_steps, (1,), device='cuda')
+            original_inputs = next(train_iter)['input_ids']
+            inputs = torch.tensor(original_inputs, device='cuda')
             
-            torch.compiler.cudagraph_mark_step_begin()
-            step_loss = model(
-                inputs,
-                t,
-                inputs
-            )
-            loss += step_loss / args.grad_acc_steps
-        loss.backward()
+            # take gemma input and convert split it by original document where each document can have a maximum number of tokens of max_input_length
+            bos_positions = (inputs == tokenizer.bos_token_id).nonzero().tolist()
+            max_input_length = 128
+            if len(bos_positions) == 0:
+                if inputs.size(0) > max_input_length:
+                    inputs = inputs[:max_input_length]
+                inputs = [inputs]
+            else:
+                result = []
+                last_pos = 0
+                bos_positions = [pos[0] for pos in bos_positions]
+                if bos_positions[0] == tokenizer.bos_token_id:
+                    bos_positions.pop(0)
+                for new_pos in bos_positions:
+                    current_input = inputs[last_pos : new_pos]
+                    if current_input.size(0) > max_input_length:
+                        current_input = current_input[:max_input_length]
+                    result.append(current_input)
+                    last_pos = new_pos
+                current_input = inputs[last_pos : inputs.size(0)]
+                if current_input.size(0) > max_input_length:
+                    current_input = current_input[:max_input_length]
+                result.append(current_input)
+                inputs = result
+            for document in inputs:
+                B = document.size(0)
+                # Check if inputs exceed sequence length - can happen if the dataset has different sized examples
+                if B > args.train_seq_len:
+                    document = document[:args.train_seq_len]
+                t = torch.randint(0, model.num_steps, (1,), device='cuda')
+            
+                torch.compiler.cudagraph_mark_step_begin()
+                logits, step_loss, transcoder_activations = model(
+                    document,
+                    t,
+                    document
+                )
+                loss += step_loss / args.grad_acc_steps
+                transcoder_activations = [activation.mean(dim=(0, 1)) / args.grad_acc_steps for activation in transcoder_activations]
+                for transcoder_index, activation in enumerate(transcoder_activations):
+                    layer = descriptions[transcoder_index]
+                    total_activation = activation.sum()
+                    for pos in layer.keys():
+                        #pos_descriptions = layer[pos]
+                        # we don't need to use absolute value as this is the activation of a ReLU layer
+                        importance = activation[pos] / total_activation
+                        # add to the list the document with its importance. Then sort the documents as we only want to retain the top 10
+                        layer[pos].append((importance, document.detach()))
+                        layer[pos].sort(key=lambda doc_tuple: doc_tuple[0], reverse=True)
+                        if len(layer[pos]) > 10:
+                            layer[pos] = layer[pos][:10]
             
         if world_size > 1:
             for param in model.parameters():
                 dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
-        # set optimization hyperparameters
-        for opt in optimizers:
-            for group in opt.param_groups:
-                group["lr"] = group["initial_lr"] * get_lr(step)
-        for group in optimizer2.param_groups:
-            frac = min(step / 300, 1) # momentum warmup for muon
-            group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
-        # step the optimizers
-        for opt in optimizers:
-            opt.step()
         # null the gradients
         model.zero_grad(set_to_none=True)
             
@@ -555,58 +547,6 @@ def main():
 
     if world_size > 1:
         dist.destroy_process_group()
-
-    ########################################
-    #        FINAL OUTPUT EXAMPLES         #
-    ########################################
-
-    def sample_from_model(model, tokenizer, prompt, max_new_tokens=100, temperature=0.8, top_k=200):
-        """Generate text samples from the model given a prompt."""
-        #tokenizer_config = pickle.load(open(f"tokenizers/{args.tokenizer}", 'rb'))
-        #enc = tiktoken.Encoding(
-        #    name=args.tokenizer[:-4], # :-4 to remove the .pkl
-        #    pat_str=tokenizer_config['pat_str'],
-        #    mergeable_ranks=tokenizer_config['mergeable_ranks'],
-        #    special_tokens={
-        #        "<|endoftext|>": len(tokenizer_config['mergeable_ranks']),
-        #    }
-        #)
-        #encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
-        #decode = lambda l: enc.decode(l)
-        encode = tokenizer.encode
-        decode = tokenizer.decode
-        
-        # Encode the prompt
-        input_ids = encode(prompt)[:-1]
-        x = torch.tensor(input_ids, dtype=torch.int32, device="cuda")
-        # add leading token 50256
-        #leading_token = torch.tensor([50256], dtype=x.dtype, device=x.device)
-        #x = torch.cat([leading_token, x])
-
-        # Generate
-        model.eval()
-        with torch.no_grad():
-            outputs = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
-        
-        # Decode and return
-        #return decode(y[1:].tolist())
-        #return decode(y.tolist())
-        return [decode(y.tolist()) for y in outputs]
-
-    # Then at the end of training:
-    if master_process: 
-        print0(master_process, logfile, "-"*10 + " EXAMPLE MODEL GENERATIONS AFTER TRAINING " + "-"*10)
-        prompts = [
-            "Once upon a time,",
-            "The meaning of life is",
-            "In the year 2026,",
-            "I'm a Large Language Model (LLM), which means",
-            "2 + 3 = "
-        ]
-        for prompt in prompts:
-            continuations = sample_from_model(model, tokenizer, prompt, max_new_tokens=16)
-            for index, continuation in enumerate(continuations):
-                print0(master_process, logfile, f"iteration: {index}, continuation={continuation}", console=True)
             
 if __name__ == "__main__":
     main()
